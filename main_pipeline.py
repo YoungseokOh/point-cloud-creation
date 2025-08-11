@@ -56,21 +56,35 @@ def find_lidar_line_by_x(pcd: o3d.geometry.PointCloud, x_value: float, tolerance
     return line_points
 
 # --- Main Execution Block ---
-from visualize_depth_comparison import visualize_pcd_comparison # visualize_pcd_comparison 임포트 추가
+from typing import Optional
+from visualize_depth_comparison import visualize_pcd_comparison, visualize_original_and_line_projection, show_interactive_projected_pcd_viewer
+from ref.camera_lidar_projector import CalibrationDB, DEFAULT_CALIB, DEFAULT_LIDAR_TO_WORLD_v2, load_image # load_image, CalibrationDB, DEFAULT_CALIB, DEFAULT_LIDAR_TO_WORLD 임포트 추가
 
 if __name__ == "__main__":
     PROJECT_ROOT = Path("C:\\Users\\seok436\\Documents\\VSCode\\Projects\\point-cloud-creation\\point-cloud-creation")
     INPUT_DATA_DIR = PROJECT_ROOT / "ncdb-cls-sample" / "synced_data"
     INPUT_PCD_DIR = INPUT_DATA_DIR / "pcd"
+    INPUT_IMG_DIR = INPUT_DATA_DIR / "image_a6" # 이미지 디렉토리 추가
     OUTPUT_DIR = PROJECT_ROOT / "output" # 새로운 출력 폴더 정의
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True) # 출력 폴더 생성
 
-    TARGET_PCD_FILENAME = "0000001996.pcd"
-    TARGET_X_VALUE = -2.0 # 예시 X 값, 실제 PCD 데이터에 따라 조정 필요
+    TARGET_PCD_FILENAME = "0000001968.pcd"
+    TARGET_IMAGE_FILENAME = "0000001968.jpg" # 이미지 파일명 추가
+    TARGET_X_VALUE = -3.0 # 예시 X 값, 실제 PCD 데이터에 따라 조정 필요
     TOLERANCE = 0.05 # 예시 허용 오차
 
     input_pcd_path = INPUT_PCD_DIR / TARGET_PCD_FILENAME
     original_pcd = load_lidar_pcd(input_pcd_path)
+
+    input_img_path = INPUT_IMG_DIR / TARGET_IMAGE_FILENAME # 이미지 경로
+    try:
+        image = load_image(input_img_path)
+        print(f"Successfully loaded image: {input_img_path}")
+    except FileNotFoundError:
+        print(f"Error: Could not load image from {input_img_path}.")
+        exit()
+
+    calib_db = CalibrationDB(DEFAULT_CALIB, lidar_to_world=DEFAULT_LIDAR_TO_WORLD_v2) # 캘리브레이션 데이터베이스 로드
 
     if original_pcd:
         lidar_line_points = find_lidar_line_by_x(original_pcd, TARGET_X_VALUE, TOLERANCE)
@@ -82,10 +96,19 @@ if __name__ == "__main__":
             o3d.io.write_point_cloud(str(output_line_pcd_path), line_pcd)
             print(f"LiDAR 라인 포인트가 {output_line_pcd_path}에 저장되었습니다.")
 
-            # 원본 PCD와 추출된 라인 PCD를 비교 시각화
-            comparison_png_path = OUTPUT_DIR / "lidar_line_comparison.png"
-            visualize_pcd_comparison(input_pcd_path, output_line_pcd_path, comparison_png_path)
-            print(f"LiDAR 라인 비교 시각화 이미지가 {comparison_png_path}에 저장되었습니다.")
+            # 원본 PCD와 추출된 라인 PCD를 3D로 비교 시각화
+            comparison_3d_png_path = OUTPUT_DIR / "lidar_line_comparison_3d.png"
+            visualize_pcd_comparison(input_pcd_path, output_line_pcd_path, comparison_3d_png_path)
+            print(f"LiDAR 라인 3D 비교 시각화 이미지가 {comparison_3d_png_path}에 저장되었습니다.")
+
+            # 원본과 추출된 라인 포인트의 이미지 투영 비교 시각화
+            projected_comparison_png_path = OUTPUT_DIR / "lidar_line_projected_comparison.png"
+            visualize_original_and_line_projection(original_pcd, lidar_line_points, image, calib_db, projected_comparison_png_path)
+            print(f"LiDAR 라인 이미지 투영 비교 시각화 이미지가 {projected_comparison_png_path}에 저장되었습니다.")
+
+            # 인터랙티브 뷰어 호출
+            show_interactive_projected_pcd_viewer(original_pcd, lidar_line_points, image, calib_db)
+
         else:
             print("LiDAR 라인을 찾지 못했습니다.")
     else:
