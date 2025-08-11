@@ -1,0 +1,23 @@
+# Ignored directories and files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS generated files
+.DS_Store
+.localized
+Thumbs.db
+
+# IDE specific files
+.vscode/
+.idea/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Data directories
+ncdb-cls-sample/
+output/
