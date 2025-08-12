@@ -4,7 +4,7 @@ import numpy as np
 import cv2
 # from PIL import Image # Removed PIL import
 import sys
-from calibration_data import DEFAULT_CALIB
+from .ref_calibration_data import DEFAULT_CALIB
 
 # 전역 변수 초기화
 depth_map_display = None # 원본 깊이 맵 (미터 단위)

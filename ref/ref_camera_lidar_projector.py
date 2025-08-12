@@ -7,7 +7,7 @@ import traceback
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 from PyQt5.QtWidgets import QApplication, QFileDialog
-from ref.calibration_data import DEFAULT_CALIB, DEFAULT_LIDAR_TO_WORLD_v2
+from .ref_calibration_data import DEFAULT_CALIB, DEFAULT_LIDAR_TO_WORLD_v2
 import numpy as np
 from PIL import Image, ImageDraw
 import cv2

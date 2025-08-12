@@ -1,0 +1,10 @@
+feat: Add depth filtering and interactive viewer enhancements
+
+- Implemented depth filtering for point clouds in `main_pipeline.py`.
+- Enhanced the interactive PCD viewer in `visualize_depth_comparison.py` with:
+    - Toggleable display modes (all PCDs vs. depth-filtered PCDs).
+    - Improved panning and zooming performance by pre-rendering images.
+    - Display of camera and world coordinates on mouse hover.
+- Refactored and renamed reference modules in the `ref` directory to follow `ref_` prefix convention.
+- Updated `GEMINI.md` with new instructions.
+- Added daily work log for 2025-08-12.
