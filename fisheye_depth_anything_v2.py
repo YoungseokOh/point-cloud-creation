@@ -5,42 +5,14 @@ import cv2 as cv
 from PIL import Image
 import torch
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
-
-def load_calib(json_path):
-    with open(json_path, "r") as f:
-        data = json.load(f)
-    K = np.array(data["K"], dtype=np.float64)
-    D = np.array(data["D"], dtype=np.float64).reshape(-1, 1)
-    if D.size not in (4, 8, 12):
-        raise ValueError("fisheye D should have 4 coeffs (k1..k4).")
-    img_size = tuple(data.get("image_size", (0, 0)))
-    return K, D, img_size
-
-def fisheye_undistort_bilinear(bgr, K, D, out_size=None, balance=0.0, fov_scale=1.0):
-    """
-    Fisheye -> Rectified(Bilinear). 반환: (undistorted_bgr, new_K)
-    - balance: [0..1] (0=crop, 1=FOV 유지)
-    - fov_scale: 새 초점 스케일 ( <1 넓게, >1 좁게 )
-    """
-    h, w = bgr.shape[:2]
-    if out_size is None:
-        out_size = (w, h)
-    new_K = cv.fisheye.estimateNewCameraMatrixForUndistortRectify(
-        K, D, (w, h), np.eye(3), balance=balance, new_size=out_size
-    )
-    new_K[0, 0] *= fov_scale
-    new_K[1, 1] *= fov_scale
-
-    map1, map2 = cv.fisheye.initUndistortRectifyMap(
-        K, D, np.eye(3), new_K, out_size, cv.CV_16SC2
-    )
-    undistorted = cv.remap(bgr, map1, map2, interpolation=cv.INTER_LINEAR, borderMode=cv.BORDER_CONSTANT)
-    return undistorted, new_K
+from ref.ref_calibration_data import DEFAULT_CALIB
+from ref.vadas_undistortion_utils import get_vadas_undistortion_maps
 
 @torch.inference_mode()
 def run_depth_anything_v2(rgb_pil, model_id="depth-anything/Depth-Anything-V2-Base-hf", device=None, half=False):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    processor = AutoImageProcessor.from_pretrained(model_id)
+    print(f"[INFO] Using device: {device}") # ADDED: Print selected device
+    processor = AutoImageProcessor.from_pretrained(model_id, use_fast=False)
     model = AutoModelForDepthEstimation.from_pretrained(model_id).to(device)
     if half and device == "cuda":
         model = model.half()
@@ -76,34 +48,7 @@ def save_depth_maps(depth01, out_prefix):
     cv.imwrite(str(out_prefix.with_suffix(".jet.png")), jet)
     return d8, jet  # [ADDED] 후속 오버레이용
 
-# [ADDED] fisheye 그리드(원본) -> rectified 평면 좌표 맵 생성
-def build_fisheye_to_rect_map(K, D, new_K, src_size, rect_size):
-    """
-    src_size: (W_src, H_src)  (원본 fisheye)
-    rect_size: (W_rect, H_rect) (rectified)
-    반환: mapx, mapy, valid(0/1 float32)
-    """
-    W_s, H_s = src_size
-    W_r, H_r = rect_size
 
-    # (u,v) grid on fisheye image
-    uu, vv = np.meshgrid(np.arange(W_s, dtype=np.float32),
-                         np.arange(H_s, dtype=np.float32))
-    pts = np.stack([uu, vv], axis=-1).reshape(-1, 1, 2)  # (N,1,2)
-
-    # 각 fisheye 픽셀이 rectified 평면에서 어디로 가는지 (픽셀 좌표) 계산
-    rect_pts = cv.fisheye.undistortPoints(
-        pts, K, D, R=np.eye(3), P=new_K
-    ).reshape(H_s, W_s, 2).astype(np.float32)
-
-    mapx = rect_pts[..., 0]
-    mapy = rect_pts[..., 1]
-
-    # 유효한 좌표 (rectified 이미지 범위 안)
-    valid = ((mapx >= 0) & (mapx < (W_r - 1)) &
-             (mapy >= 0) & (mapy < (H_r - 1))).astype(np.float32)
-
-    return mapx, mapy, valid
 
 # [ADDED] Overlay & Mosaic helpers
 def make_overlay(bgr, depth01, valid_mask=None, alpha=0.55):
@@ -144,7 +89,6 @@ def save_mosaic(path, tiles, scale_to_height=None):
 def main():
     ap = argparse.ArgumentParser(description="Fisheye → Rectified → Depth Anything V2 → Back-project to Fisheye")
     ap.add_argument("--image", required=True, help="Input fisheye image path")
-    ap.add_argument("--calib", required=True, help="Calibration JSON (K,D,image_size)")
     ap.add_argument("--out",   required=True, help="Output prefix (e.g., ./out/result)")
     ap.add_argument("--model", default="depth-anything/Depth-Anything-V2-Base-hf",
                     help="HF model id (Small/Base/Large): depth-anything/Depth-Anything-V2-*-hf")
@@ -152,26 +96,44 @@ def main():
     ap.add_argument("--fov-scale", type=float, default=1.0, help="Scale new_K focal (<1 wider)")
     ap.add_argument("--out-width", type=int, default=0, help="Rectified width (0→input W)")
     ap.add_argument("--out-height", type=int, default=0, help="Rectified height (0→input H)")
+    ap.add_argument("--rectified-fov-scale", type=float, default=1.0, help="Scale factor for rectified image FOV (<1.0 for wider FOV)")
     ap.add_argument("--device", default=None, help="cuda | cpu (default: auto)")
     ap.add_argument("--fp16", action="store_true", help="Use half precision on CUDA")
     ap.add_argument("--no-back-project", action="store_true", help="Skip mapping depth back to fisheye grid")
+    ap.add_argument("--no-undistort", action="store_true", help="Skip undistortion and use raw fisheye image for depth inference")
     args = ap.parse_args()
 
-    # --- Load & Rectify
+    # --- Load & Process Image ---
     bgr_fish = cv.imread(args.image, cv.IMREAD_COLOR)
     if bgr_fish is None:
         raise FileNotFoundError(args.image)
 
-    K, D, img_size = load_calib(args.calib)
     Hs, Ws = bgr_fish.shape[:2]
-    if img_size != (0, 0) and tuple(img_size) != (Ws, Hs):
-        print(f"[WARN] calib image_size {img_size} != input image size {(Ws,Hs)}; proceeding anyway.")
 
-    rect_size = (args.out_width or Ws, args.out_height or Hs)
-    bgr_rect, new_K = fisheye_undistort_bilinear(
-        bgr_fish, K, D, out_size=rect_size, balance=args.balance, fov_scale=args.fov_scale
-    )
-    Hr, Wr = bgr_rect.shape[:2]
+    if args.no_undistort:
+        print("[INFO] Skipping undistortion. Using raw fisheye image for depth inference.")
+        bgr_rect = bgr_fish # Use raw fisheye image as rectified
+        Hr, Wr = Hs, Ws
+        # If no undistortion, no back-projection is meaningful
+        args.no_back_project = True
+    else:
+        # VADAS 캘리브레이션 데이터 로드
+        vadas_intrinsic = DEFAULT_CALIB["a6"]["intrinsic"]
+        original_image_size = (Ws, Hs)
+
+        rect_size = (args.out_width or Ws, args.out_height or Hs)
+        
+        # VADAS 모델을 사용하여 왜곡 보정 맵 생성
+        map1, map2 = get_vadas_undistortion_maps(
+            vadas_intrinsic,
+            original_image_size,
+            rectified_size=rect_size,
+            rectified_fov_scale=args.rectified_fov_scale
+        )
+
+        # cv.remap을 사용하여 이미지 왜곡 보정
+        bgr_rect = cv.remap(bgr_fish, map1, map2, interpolation=cv.INTER_LINEAR, borderMode=cv.BORDER_CONSTANT)
+        Hr, Wr = bgr_rect.shape[:2]
 
     # --- Depth Inference on Rectified
     rgb_rect = cv.cvtColor(bgr_rect, cv.COLOR_BGR2RGB)
@@ -189,14 +151,14 @@ def main():
     cv.imwrite(str(rect_prefix.with_name(rect_prefix.name + ".rect.overlay.png")), overlay_rect)
 
     if not args.no_back_project:
-        # [ADDED] --- Build inverse mapping: fisheye grid → rectified coords
-        mapx, mapy, valid = build_fisheye_to_rect_map(
-            K, D, new_K, src_size=(Ws, Hs), rect_size=(Wr, Hr)
-        )
+        # [ADDED] --- Back-project rectified depth to fisheye grid
+        # map1, map2는 이미 get_vadas_undistortion_maps에서 생성됨
+        # valid 마스크는 map1, map2의 유효하지 않은 값(-1)을 통해 생성
+        valid = ((map1 != -1) & (map2 != -1)).astype(np.float32)
 
         # [ADDED] --- Back-project rectified depth to fisheye grid
         depth_fish01 = cv.remap(
-            depth_rect01.astype(np.float32), mapx, mapy,
+            depth_rect01.astype(np.float32), map1, map2,
             interpolation=cv.INTER_LINEAR, borderMode=cv.BORDER_CONSTANT, borderValue=0
         )
         # 유효 픽셀만 남기기 (나머지 0)

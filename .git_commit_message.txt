@@ -1,10 +1,8 @@
-feat: Add depth filtering and interactive viewer enhancements
+feat: Enhance depth estimation script and update project configuration
 
-- Implemented depth filtering for point clouds in `main_pipeline.py`.
-- Enhanced the interactive PCD viewer in `visualize_depth_comparison.py` with:
-    - Toggleable display modes (all PCDs vs. depth-filtered PCDs).
-    - Improved panning and zooming performance by pre-rendering images.
-    - Display of camera and world coordinates on mouse hover.
-- Refactored and renamed reference modules in the `ref` directory to follow `ref_` prefix convention.
-- Updated `GEMINI.md` with new instructions.
-- Added daily work log for 2025-08-12.
+- Refactor `fisheye_depth_anything_v2.py` to use VADAS undistortion utilities.
+- Add device logging and suppress `transformers` warning in `fisheye_depth_anything_v2.py`.
+- Update VS Code `launch.json` with a dedicated configuration for `fisheye_depth_anything_v2.py` including arguments.
+- Update daily work log for 2025-08-12, marking CUDA environment setup as complete.
+- Add `.gitignore` instruction to `GEMINI.md`.
+- Remove temporary file `4.53.3`.
