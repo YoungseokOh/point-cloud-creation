@@ -1,17 +1,28 @@
-import argparse, json
+# depth_infer_raw.py
+# [SIMPLIFIED] 원본 이미지에 바로 Depth Anything V2 추론 → raw .npy 및 시각화 저장
+
+import argparse
 from pathlib import Path
 import numpy as np
 import cv2 as cv
 from PIL import Image
 import torch
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
-from ref.ref_calibration_data import DEFAULT_CALIB
-from ref.vadas_undistortion_utils import get_vadas_undistortion_maps
 
 @torch.inference_mode()
-def run_depth_anything_v2(rgb_pil, model_id="depth-anything/Depth-Anything-V2-Base-hf", device=None, half=False):
+def run_depth_anything_v2(rgb_pil,
+                          model_id="depth-anything/Depth-Anything-V2-Base-hf",
+                          device=None,
+                          half=False):
+    """
+    원본 RGB(PIL) 이미지를 입력으로 Depth Anything V2 추론.
+    반환:
+      depth01: (H,W) [0,1] 정규화 깊이 (시각화용)
+      raw_depth_tensor: (1,H,W) 원시 깊이 텐서 (모델 출력)
+    """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] Using device: {device}") # ADDED: Print selected device
+    print(f"[INFO] Using device: {device}")
+
     processor = AutoImageProcessor.from_pretrained(model_id, use_fast=False)
     model = AutoModelForDepthEstimation.from_pretrained(model_id).to(device)
     if half and device == "cuda":
@@ -23,174 +34,106 @@ def run_depth_anything_v2(rgb_pil, model_id="depth-anything/Depth-Anything-V2-Ba
     inputs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
 
     outputs = model(**inputs)
+
+    # HF processor로 원본 해상도로 후처리
     post = processor.post_process_depth_estimation(
         outputs, target_sizes=[(rgb_pil.height, rgb_pil.width)]
-    )[0]["predicted_depth"]
-    d = post.detach().float()
-    d = (d - d.min()) / (d.max() - d.min() + 1e-8)  # per-image [0,1]
-    return d.cpu().numpy()
+    )[0]["predicted_depth"]  # (H,W) torch.Tensor
 
-def save_depth_maps(depth01, out_prefix):
+    # 시각화를 위해 [0,1] 정규화
+    d = post.detach().float()
+    d01 = (d - d.min()) / (d.max() - d.min() + 1e-8)
+
+    # raw 텐서는 (1,H,W) 모양이 일반적이므로 맞춰서 반환
+    raw_depth = outputs["predicted_depth"] if isinstance(outputs, dict) else outputs.predicted_depth
+    return d01.cpu().numpy(), raw_depth
+
+def save_depth_products(depth01, out_prefix, raw_depth_tensor=None):
     """
-    저장:
-      - out_prefix.png           : 8-bit depth (미리보기)
-      - out_prefix.16bit.png     : 16-bit depth (상대깊이)
-      - out_prefix.jet.png       : JET 컬러맵
+    저장 산출물:
+      - {out_prefix}.png            : 8-bit 정규화 깊이
+      - {out_prefix}.16bit.png      : 16-bit 정규화 깊이
+      - {out_prefix}.jet.png        : JET 컬러맵
+      - {out_prefix}.raw.npy        : 원시 모델 출력 (정규화 전, float32 저장)
+      - {out_prefix}.raw.png        : 원시 모델 출력의 16-bit 시각화
+    반환:
+      d8(8-bit), jet(BGR)
     """
     out_prefix = Path(out_prefix)
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
 
+    # [0,1] → 8/16-bit
     d8 = (depth01 * 255.0).clip(0, 255).astype(np.uint8)
     d16 = (depth01 * 65535.0).clip(0, 65535).astype(np.uint16)
+
     cv.imwrite(str(out_prefix.with_suffix(".png")), d8)
     cv.imwrite(str(out_prefix.with_suffix(".16bit.png")), d16)
+
     jet = cv.applyColorMap(d8, cv.COLORMAP_JET)
     cv.imwrite(str(out_prefix.with_suffix(".jet.png")), jet)
-    return d8, jet  # [ADDED] 후속 오버레이용
 
+    # raw 저장 (정규화 없이 .npy) + 16-bit 시각화 png
+    if raw_depth_tensor is not None:
+        raw_np = raw_depth_tensor.detach().cpu().numpy()
+        # 예상 모양: (1, H, W) → (H, W)
+        if raw_np.ndim == 3 and raw_np.shape[0] == 1:
+            raw_np = raw_np.squeeze(0)
 
+        # npy 저장 (float32 권장)
+        np.save(str(out_prefix.with_suffix(".raw.npy")), raw_np.astype(np.float32))
 
-# [ADDED] Overlay & Mosaic helpers
-def make_overlay(bgr, depth01, valid_mask=None, alpha=0.55):
+        # 16-bit png 시각화용 min-max 정규화
+        rmin, rmax = raw_np.min(), raw_np.max()
+        if rmax - rmin > 1e-8:
+            raw_png = ((raw_np - rmin) / (rmax - rmin) * 65535.0).clip(0, 65535).astype(np.uint16)
+        else:
+            raw_png = np.zeros_like(raw_np, dtype=np.uint16)
+        cv.imwrite(str(out_prefix.with_suffix(".raw.png")), raw_png)
+
+    return d8, jet
+
+def save_overlay(bgr, depth01, out_path, alpha=0.55):
+    """
+    입력 BGR 위에 깊이 컬러맵 오버레이 저장
+    """
     d8 = (depth01 * 255.0).clip(0, 255).astype(np.uint8)
     jet = cv.applyColorMap(d8, cv.COLORMAP_JET)
-    if valid_mask is not None:
-        vm = (valid_mask * 255).astype(np.uint8)
-        jet = cv.bitwise_and(jet, jet, mask=vm)
     overlay = cv.addWeighted(bgr, 1 - alpha, jet, alpha, 0)
-    return overlay, jet, d8
-
-def save_mosaic(path, tiles, scale_to_height=None):
-    """
-    tiles: [(img_bgr, title_str), ...]  가로로 이어붙인 뒤 세로 스택
-    scale_to_height: 모든 타일을 동일 높이로 리사이즈(옵션)
-    """
-    rows = []
-    for row in tiles:
-        imgs = []
-        h_target = scale_to_height or min(img.shape[0] for img, _ in row)
-        for img, title in row:
-            # 높이 기준 리사이즈
-            h, w = img.shape[:2]
-            if h != h_target:
-                w_new = int(w * (h_target / h))
-                img = cv.resize(img, (w_new, h_target), interpolation=cv.INTER_AREA)
-            # 타이틀 라벨 얇게 추가
-            pad = 36
-            canvas = np.zeros((img.shape[0] + pad, img.shape[1], 3), np.uint8)
-            canvas[:img.shape[0], :, :] = img
-            cv.putText(canvas, title, (10, img.shape[0] + 26),
-                       cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv.LINE_AA)
-            imgs.append(canvas)
-        rows.append(cv.hconcat(imgs))
-    mosaic = cv.vconcat(rows)
-    cv.imwrite(str(path), mosaic)
+    cv.imwrite(str(out_path), overlay)
 
 def main():
-    ap = argparse.ArgumentParser(description="Fisheye → Rectified → Depth Anything V2 → Back-project to Fisheye")
-    ap.add_argument("--image", required=True, help="Input fisheye image path")
-    ap.add_argument("--out",   required=True, help="Output prefix (e.g., ./out/result)")
+    ap = argparse.ArgumentParser(description="Run Depth Anything V2 on the raw image and save raw/visualizations")
+    ap.add_argument("--image", required=True, help="Input image path")
+    ap.add_argument("--out", required=True, help="Output prefix, e.g., ./out/result")
     ap.add_argument("--model", default="depth-anything/Depth-Anything-V2-Base-hf",
-                    help="HF model id (Small/Base/Large): depth-anything/Depth-Anything-V2-*-hf")
-    ap.add_argument("--balance", type=float, default=0.0, help="Undistort balance [0..1]")
-    ap.add_argument("--fov-scale", type=float, default=1.0, help="Scale new_K focal (<1 wider)")
-    ap.add_argument("--out-width", type=int, default=0, help="Rectified width (0→input W)")
-    ap.add_argument("--out-height", type=int, default=0, help="Rectified height (0→input H)")
-    ap.add_argument("--rectified-fov-scale", type=float, default=1.0, help="Scale factor for rectified image FOV (<1.0 for wider FOV)")
+                    help="HF model id (Small/Base/Large), e.g., depth-anything/Depth-Anything-V2-Base-hf")
     ap.add_argument("--device", default=None, help="cuda | cpu (default: auto)")
     ap.add_argument("--fp16", action="store_true", help="Use half precision on CUDA")
-    ap.add_argument("--no-back-project", action="store_true", help="Skip mapping depth back to fisheye grid")
-    ap.add_argument("--no-undistort", action="store_true", help="Skip undistortion and use raw fisheye image for depth inference")
     args = ap.parse_args()
 
-    # --- Load & Process Image ---
-    bgr_fish = cv.imread(args.image, cv.IMREAD_COLOR)
-    if bgr_fish is None:
+    # 원본 이미지 로드
+    bgr = cv.imread(args.image, cv.IMREAD_COLOR)
+    if bgr is None:
         raise FileNotFoundError(args.image)
+    print(f"[DEBUG] Input image shape: {bgr.shape}")
 
-    Hs, Ws = bgr_fish.shape[:2]
-
-    if args.no_undistort:
-        print("[INFO] Skipping undistortion. Using raw fisheye image for depth inference.")
-        bgr_rect = bgr_fish # Use raw fisheye image as rectified
-        Hr, Wr = Hs, Ws
-        # If no undistortion, no back-projection is meaningful
-        args.no_back_project = True
-    else:
-        # VADAS 캘리브레이션 데이터 로드
-        vadas_intrinsic = DEFAULT_CALIB["a6"]["intrinsic"]
-        original_image_size = (Ws, Hs)
-
-        rect_size = (args.out_width or Ws, args.out_height or Hs)
-        
-        # VADAS 모델을 사용하여 왜곡 보정 맵 생성
-        map1, map2 = get_vadas_undistortion_maps(
-            vadas_intrinsic,
-            original_image_size,
-            rectified_size=rect_size,
-            rectified_fov_scale=args.rectified_fov_scale
-        )
-
-        # cv.remap을 사용하여 이미지 왜곡 보정
-        bgr_rect = cv.remap(bgr_fish, map1, map2, interpolation=cv.INTER_LINEAR, borderMode=cv.BORDER_CONSTANT)
-        Hr, Wr = bgr_rect.shape[:2]
-
-    # --- Depth Inference on Rectified
-    rgb_rect = cv.cvtColor(bgr_rect, cv.COLOR_BGR2RGB)
-    depth_rect01 = run_depth_anything_v2(
-        Image.fromarray(rgb_rect), model_id=args.model, device=args.device, half=args.fp16
+    # RGB(PIL)로 변환 후 추론
+    rgb = cv.cvtColor(bgr, cv.COLOR_BGR2RGB)
+    depth01, raw_depth_tensor = run_depth_anything_v2(
+        Image.fromarray(rgb),
+        model_id=args.model,
+        device=args.device,
+        half=args.fp16
     )
-    assert depth_rect01.shape == (Hr, Wr), f"Depth shape {depth_rect01.shape} != rectified {(Hr,Wr)}"
 
-    # Save rectified depth (8/16bit + JET)
-    rect_prefix = Path(args.out).with_suffix("")  # base prefix
-    d8_rect, jet_rect = save_depth_maps(depth_rect01, rect_prefix.with_name(rect_prefix.name + ".rect"))
+    # 저장: 정규화 깊이, JET, raw .npy/.png
+    out_prefix = Path(args.out).with_suffix("")  # 확장자 제거한 prefix
+    d8, jet = save_depth_products(depth01, out_prefix, raw_depth_tensor=raw_depth_tensor)
 
-    # Rectified overlay 저장
-    overlay_rect, jet_for_rect, _ = make_overlay(bgr_rect, depth_rect01, valid_mask=None, alpha=0.55)
-    cv.imwrite(str(rect_prefix.with_name(rect_prefix.name + ".rect.overlay.png")), overlay_rect)
+    # 오버레이 저장
+    save_overlay(bgr, depth01, out_prefix.with_suffix(".overlay.png"), alpha=0.55)
 
-    if not args.no_back_project:
-        # [ADDED] --- Back-project rectified depth to fisheye grid
-        # map1, map2는 이미 get_vadas_undistortion_maps에서 생성됨
-        # valid 마스크는 map1, map2의 유효하지 않은 값(-1)을 통해 생성
-        valid = ((map1 != -1) & (map2 != -1)).astype(np.float32)
-
-        # [ADDED] --- Back-project rectified depth to fisheye grid
-        depth_fish01 = cv.remap(
-            depth_rect01.astype(np.float32), map1, map2,
-            interpolation=cv.INTER_LINEAR, borderMode=cv.BORDER_CONSTANT, borderValue=0
-        )
-        # 유효 픽셀만 남기기 (나머지 0)
-        depth_fish01 *= valid
-
-        # [ADDED] 저장: fisheye 좌표계 depth + mask + overlay
-        fish_prefix = rect_prefix.with_name(rect_prefix.name + ".fish")
-        d8_fish, jet_fish = save_depth_maps(depth_fish01, fish_prefix)
-
-        valid_u8 = (valid * 255).astype(np.uint8)
-        cv.imwrite(str(fish_prefix.with_suffix(".mask.png")), valid_u8)
-
-        overlay_fish, _, _ = make_overlay(bgr_fish, depth_fish01, valid_mask=valid, alpha=0.55)
-        cv.imwrite(str(fish_prefix.with_suffix(".overlay.png")), overlay_fish)
-
-        # [ADDED] 모자이크: 시각 점검(원본RGB/RectRGB, FisheyeOverlay/RectOverlay)
-        mosaic_path = rect_prefix.with_name(rect_prefix.name + ".mosaic.png")
-        save_mosaic(
-            mosaic_path,
-            tiles=[
-                [(bgr_fish, "Fisheye RGB (input)"), (bgr_rect, "Rectified RGB")],
-                [(overlay_fish, "Fisheye Overlay (Depth back-projected)"),
-                 (overlay_rect, "Rectified Overlay (Depth predicted)")]
-            ],
-            scale_to_height=min(Hs, Hr)
-        )
-
-        # [ADDED] (선택) Rectified RGB를 같은 맵으로 fisheye로 되돌려 비교해보고 싶다면:
-        # rect2fish = cv.remap(bgr_rect, mapx, mapy, interpolation=cv.INTER_LINEAR, borderMode=cv.BORDER_CONSTANT)
-        # cv.imwrite(str(rect_prefix.with_name(rect_prefix.name + ".rect2fish.rgb.png")), rect2fish)
-
-    print("[DONE] Saved outputs under:", rect_prefix.parent)
+    print("[DONE] Saved outputs under:", out_prefix.parent)
 
 if __name__ == "__main__":
     main()

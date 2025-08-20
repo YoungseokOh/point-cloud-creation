@@ -1,8 +1,0 @@
-feat: Enhance depth estimation script and update project configuration
-
-- Refactor `fisheye_depth_anything_v2.py` to use VADAS undistortion utilities.
-- Add device logging and suppress `transformers` warning in `fisheye_depth_anything_v2.py`.
-- Update VS Code `launch.json` with a dedicated configuration for `fisheye_depth_anything_v2.py` including arguments.
-- Update daily work log for 2025-08-12, marking CUDA environment setup as complete.
-- Add `.gitignore` instruction to `GEMINI.md`.
-- Remove temporary file `4.53.3`.

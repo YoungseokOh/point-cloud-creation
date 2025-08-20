@@ -112,8 +112,8 @@ if __name__ == "__main__":
     OUTPUT_DIR = PROJECT_ROOT / "output" # 새로운 출력 폴더 정의
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True) # 출력 폴더 생성
 
-    TARGET_PCD_FILENAME = "0000001968.pcd"
-    TARGET_IMAGE_FILENAME = "0000001968.jpg" # 이미지 파일명 추가
+    TARGET_PCD_FILENAME = "0000000931.pcd"
+    TARGET_IMAGE_FILENAME = "0000000931.jpg" # 이미지 파일명 추가
     TARGET_X_VALUE = -3.0 # 예시 X 값, 실제 PCD 데이터에 따라 조정 필요
     TOLERANCE = 0.05 # 예시 허용 오차
     DEPTH_THRESHOLD_METERS = 2.55 # Depth 필터링을 위한 거리 임계값 (미터)

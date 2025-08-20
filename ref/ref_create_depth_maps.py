@@ -171,6 +171,16 @@ class LidarCameraProjector:
         depth_map = np.zeros((image_height, image_width), dtype=np.float32)
         
         cloud_xyz_hom = np.hstack((cloud_xyz, np.ones((cloud_xyz.shape[0], 1))))
+        # Define the exclusion condition based on Y and X coordinates
+        # Exclude points where (Y <= 0.5 and Y >= -0.7) AND (X >= 0.0)
+        exclude_y_condition = (cloud_xyz_hom[:, 1] <= 0.5) & (cloud_xyz_hom[:, 1] >= -0.7)
+        exclude_x_condition = (cloud_xyz_hom[:, 0] >= 0.0)
+        
+        # Combine conditions to get points to EXCLUDE
+        points_to_exclude = exclude_y_condition & exclude_x_condition
+        
+        # Keep only the points that are NOT in the exclusion set
+        cloud_xyz_hom = cloud_xyz_hom[~points_to_exclude]
         lidar_to_camera_transform = cam_extrinsic @ self.calib_db.lidar_to_world
         points_cam_hom = (lidar_to_camera_transform @ cloud_xyz_hom.T).T
         points_cam = points_cam_hom[:, :3]
@@ -195,7 +205,7 @@ def save_depth_map(path: Path, depth_map: np.ndarray):
     """Saves a depth map as a 16-bit PNG image, following KITTI conventions."""
     depth_map_uint16 = (depth_map * 256.0).astype(np.uint16)
     # For 16-bit PNG, use cv2.imwrite with IMWRITE_PNG_BIT_DEPTH
-    cv2.imwrite(str(path), depth_map_uint16, [cv2.IMWRITE_PNG_BIT_DEPTH, 16])
+    cv2.imwrite(str(path), depth_map_uint16)
 
 def process_folder(projector: LidarCameraProjector, parent_folder: Path, cam_name: str, output_dir: Path):
     synced_data_dir = parent_folder / "synced_data"

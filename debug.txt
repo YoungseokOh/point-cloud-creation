@@ -1,6 +1,12 @@
-Python 3.9.23 (main, Jun  5 2025, 13:25:08) [MSC v.1929 64 bit (AMD64)] on win32
-Type "help", "copyright", "credits" or "license" for more information.
->>> import torch
->>> torch.cuda.is_available()
-True
->>> torch.cuda.is_available()
+--- [DEBUG] Coordinate Transformation ---
+LiDAR → Camera Transform (Original):
+[[ 0.9456203   0.01010798 -0.32511547  0.293769  ]
+ [-0.00881369  0.99994629  0.00545355 -0.0542026 ]
+ [ 0.32515313 -0.00229153  0.9456586  -0.631615  ]
+ [ 0.          0.          0.          1.        ]]
+
+Camera → LiDAR Transform (Inverse):
+[[ 0.94562031 -0.00881369  0.32515313 -0.07290006]
+ [ 0.01010798  0.99994628 -0.00229152  0.04978292]
+ [-0.32511547  0.00545356  0.9456586   0.6930966 ]
+ [ 0.          0.          0.          1.        ]]

@@ -18,7 +18,7 @@
 ### 5. 5미터 이내 포인트 시각화 및 표시 모드 전환 기능 추가 (해결)
 - `visualize_depth_comparison.py` 파일에서 `depth_filtered_pcd`를 그릴 때 `color_override`를 "purple"로 변경했습니다.
 - `show_interactive_projected_pcd_viewer` 함수에 `local_display_mode` 상태 변수를 추가하여 "ALL" (모든 PCD)과 "DEPTH_FILTERED" (깊이 필터링된 PCD만) 모드를 전환할 수 있도록 했습니다.
-- 'p' 키 입력을 감지하여 `local_display_mode`를 토글하고 화면을 갱신하는 로직을 추가했습니다.
+- \'p\' 키 입력을 감지하여 `local_display_mode`를 토글하고 화면을 갱신하는 로직을 추가했습니다.
 
 ### 6. 마우스 호버 시 좌표 정보 변경 (해결)
 - `visualize_depth_comparison.py` 파일의 `mouse_callback_local` 함수를 수정하여 마우스 호버 시 표시되는 XYZ 좌표가 월드 좌표 대신 카메라 좌표를 나타내도록 변경했습니다. 레이블도 "Cam XYZ"로 변경했습니다.
@@ -59,6 +59,32 @@
 - CUDA Toolkit 업데이트 및 최신 NVIDIA GPU 드라이버 설치를 완료했습니다.
 - `torch` 2.1 이상 버전을 포함한 모든 필수 Python 패키지(`torch`, `transformers`, `accelerate`, `opencv-python`, `pillow`, `numpy`)를 성공적으로 재설치했습니다. 이제 `fisheye_depth_anything_v2.py` 스크립트가 CUDA를 사용하여 실행될 것입니다.
 
+### 4. 깊이 맵 스케일 비교 및 시각화 계획
+
+**목표:**
+`fisheye_depth_anything_v2.py`에서 생성된 Depth Anything V2의 `raw.png` 깊이 결과와 `C:\Users\seok436\Documents\VSCode\Projects\point-cloud-creation\point-cloud-creation\ncdb-cls-sample\synced_data\depth_maps`에 있는 기존 깊이 맵(`0000000931` 파일)의 스케일을 비교하고 시각화한다.
+
+**비교 대상 파일:**
+1.  **Depth Anything V2 결과:** `C:\Users\seok436\Documents\VSCode\Projects\point-cloud-creation\point-cloud-creation\output\single_image_test.raw.png`
+2.  **기존 깊이 맵:** `C:\Users\seok436\Documents\VSCode\Projects\point-cloud-creation\point-cloud-creation\ncdb-cls-sample\synced_data\depth_maps\0000000931.npy` (확장자는 확인 필요)
+
+**분석 및 시각화 방법:**
+*   두 깊이 맵을 로드한다.
+*   각 맵의 통계량 (최소, 최대, 평균, 표준 편차)을 계산하여 비교한다.
+*   `matplotlib`을 사용하여 두 맵을 나란히 표시하고, 컬러바를 통해 스케일을 시각적으로 비교한다.
+*   두 맵의 픽셀 값 분포를 비교하기 위해 히스토그램을 그린다.
+*   필요시 두 맵의 차이 맵을 생성하여 시각화한다.
+
 ## ToDo
 
-- (모든 ToDo 항목이 해결되어 더 이상 남은 작업이 없습니다.)
+- **Depth Anything V2 깊이 맵 스케일 조정:** `fisheye_depth_anything_v2.py`에서 생성된 상대 깊이 맵의 스케일을 `ncdb-cls-sample` 디렉토리의 PCD 데이터(절대 깊이 정보)를 이용하여 실제 스케일에 맞게 조정하는 기능을 구현해야 합니다.
+
+## 오늘 작업 내용 (2025-08-12) - `compare_depth_scales.py` 수정
+
+### 1. Depth Anything V2 출력값 스케일 조정
+- `compare_depth_scales.py`에서 Depth Anything V2의 원본 출력값(`raw.npy`)을 불러온 후, 시차(Disparity)와 유사한 특성을 가지므로 값을 뒤집어 깊이(Depth)처럼 보이도록 변환했습니다 (`np.max(output) - output`).
+
+### 2. 바이너리 마스크 적용 로직 개선
+- 마스크 적용 시, 유효 영역 판단 기준을 `> 128`에서 `> 0`으로 변경하여 마스크의 흰색 부분이 어떤 양수 값을 가져도 정상적으로 인식되도록 수정했습니다.
+- 마스크와 깊이 맵의 크기가 다를 경우 오류를 발생시키고, 크기가 같을 때만 위치를 기준으로 마스크를 적용하도록 수정했습니다 (`np.where` 사용).
+- `compare_depth_scales.py` 파일의 마스크 적용 관련 코드를 위와 같이 수정했습니다.
