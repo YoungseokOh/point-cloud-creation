@@ -260,6 +260,29 @@ def analyze_and_visualize_distributions():
     cv2.imwrite(str(affine_depth_output_path), (affine_da * 256).astype(np.uint16))
     print(f"[SAVE] Affine Scaled Depth 맵 저장: {affine_depth_output_path}")
 
+    # [ADDED] Binary Mask가 씌워지지 않은 Inverse Depth Map을 컬러맵으로 적용하여 저장
+    # da_raw는 이미 역전된 상태 (np.max(da_raw) - da_raw)
+    # 시각화를 위해 0-1 범위로 정규화
+    # da_raw의 최소/최대값이 0으로 설정될 수 있으므로, 0으로 나누는 경우를 방지
+    min_val = np.min(da_raw)
+    max_val = np.max(da_raw)
+    
+    if max_val - min_val > 0:
+        da_raw_normalized = (da_raw - min_val) / (max_val - min_val)
+    else:
+        da_raw_normalized = np.zeros_like(da_raw) # 모든 값이 동일하면 0으로 채움
+
+    # 컬러맵 적용 (예: magma)
+    cmap = plt.get_cmap('magma')
+    # matplotlib의 cmap은 RGBA를 반환하므로, RGB만 추출하고 0-255 범위로 스케일링 후 uint8로 변환
+    colored_da_raw = cmap(da_raw_normalized)[:,:,:3]
+    colored_da_raw_uint8 = (colored_da_raw * 255).astype(np.uint8)
+
+    # 저장
+    unmasked_inverse_depth_output_path = out_dir / f"unmasked_inverse_depth_map_{file_identifier}.png"
+    cv2.imwrite(str(unmasked_inverse_depth_output_path), colored_da_raw_uint8)
+    print(f"[SAVE] Binary Mask가 씌워지지 않은 Inverse Depth Map 저장: {unmasked_inverse_depth_output_path}")
+
     # --- 거리별 오차 분석 (Figure 6 참고) ---
     print("\n--- 거리별 오차 분석 ---")
     matched_labels, matched_mae = calculate_and_plot_error_by_distance(

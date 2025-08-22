@@ -8,6 +8,7 @@ import numpy as np
 import cv2
 import open3d as o3d
 import matplotlib.pyplot as plt
+from matplotlib import colors # Add this line
 from pathlib import Path
 from typing import Optional, Dict, Tuple, List
 import argparse
@@ -134,120 +135,117 @@ class VADASDepthMapConverter:
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points_3d_final)
         
-        # 거리에 따른 색상 매핑
-        distances = np.linalg.norm(points_3d_final, axis=1)
-        normalized_depth = (distances - min_depth) / (max_depth - min_depth)
-        normalized_depth = np.clip(normalized_depth, 0, 1)
-        colors = plt.cm.jet(normalized_depth)[:, :3]
-        pcd.colors = o3d.utility.Vector3dVector(colors)
-        
         return pcd
 
-    def _vadas_unproject_approximate(self, u_coords: np.ndarray, v_coords: np.ndarray, depths: np.ndarray) -> List[np.ndarray]:
-        """VADAS 모델의 근사적 역투영"""
-        points_3d = []
+    def _vadas_unproject_approximate(self, u_coords: np.ndarray, v_coords: np.ndarray, depths: np.ndarray) -> np.ndarray:
+        """VADAS 모델의 근사적 역투영 (벡터화)"""
         img_w_half = self.image_size[0] / 2
         img_h_half = self.image_size[1] / 2
         
-        processed_count = 0
-        total_count = len(u_coords)
+        u_centered = u_coords - img_w_half - self.vadas_model.ux
+        v_centered = v_coords - img_h_half - self.vadas_model.uy
         
-        for i, (u, v, depth) in enumerate(zip(u_coords, v_coords, depths)):
-            if i % 1000 == 0 and i > 0:
-                print(f"  처리 진행률: {i}/{total_count} ({i/total_count*100:.1f}%)")
-            
-            # 이미지 중심 기준 좌표
-            u_centered = u - img_w_half - self.vadas_model.ux
-            v_centered = v - img_h_half - self.vadas_model.uy
-            
-            # 반지름 계산
-            rd = math.sqrt(u_centered**2 + v_centered**2)
-            
-            if rd < 1e-6:
-                point_3d = np.array([depth, 0, 0])
-                points_3d.append(point_3d)
-                continue
-            
-            # 각도 계산
-            cosPhi = u_centered / rd
-            sinPhi = v_centered / rd
-            
-            # theta 추정
-            theta = self._estimate_theta_from_rd(rd)
-            
-            if theta is None:
-                continue
-            
-            # 3D 포인트 계산 (카메라 좌표계)
-            dist = depth * math.tan(theta)
-            
-            Xc = depth
-            Yc = -dist * cosPhi
-            Zc = -dist * sinPhi
-            
-            points_3d.append(np.array([Xc, Yc, Zc]))
-            processed_count += 1
+        rd = np.sqrt(u_centered**2 + v_centered**2)
         
-        print(f"  VADAS 역투영 완료: {processed_count}/{total_count}개 성공")
-        return points_3d
+        zero_rd_mask = rd < 1e-6
+        
+        cosPhi = np.zeros_like(rd)
+        sinPhi = np.zeros_like(rd)
+        non_zero_rd_mask = ~zero_rd_mask
+        cosPhi[non_zero_rd_mask] = u_centered[non_zero_rd_mask] / rd[non_zero_rd_mask]
+        sinPhi[non_zero_rd_mask] = v_centered[non_zero_rd_mask] / rd[non_zero_rd_mask]
+        
+        theta = self._estimate_theta_from_rd(rd)
+        
+        valid_theta_mask = ~np.isnan(theta)
+        
+        dist = np.zeros_like(depths)
+        calc_dist_mask = valid_theta_mask & non_zero_rd_mask
+        dist[calc_dist_mask] = depths[calc_dist_mask] * np.tan(theta[calc_dist_mask])
+        
+        Xc = depths
+        Yc = -dist * cosPhi
+        Zc = -dist * sinPhi
+        
+        points_3d_camera = np.full((len(u_coords), 3), np.nan, dtype=np.float64)
+
+        final_valid_mask = valid_theta_mask & non_zero_rd_mask
+        points_3d_camera[final_valid_mask, 0] = Xc[final_valid_mask]
+        points_3d_camera[final_valid_mask, 1] = Yc[final_valid_mask]
+        points_3d_camera[final_valid_mask, 2] = Zc[final_valid_mask]
+
+        points_3d_camera[zero_rd_mask, 0] = depths[zero_rd_mask]
+        points_3d_camera[zero_rd_mask, 1] = 0.0
+        points_3d_camera[zero_rd_mask, 2] = 0.0
+
+        points_3d_camera = points_3d_camera[~np.isnan(points_3d_camera).any(axis=1)]
+        
+        print(f"  VADAS 역투영 완료 (벡터화): {len(points_3d_camera)}/{len(u_coords)}개 성공")
+        return points_3d_camera
     
-    def _estimate_theta_from_rd(self, rd: float, max_iter: int = 10) -> Optional[float]:
-        """rd에서 theta를 추정하는 반복 방법"""
+    def _estimate_theta_from_rd(self, rd_array: np.ndarray, max_iter: int = 10) -> np.ndarray:
+        """rd 배열에서 theta를 추정하는 반복 방법 (벡터화)"""
         if abs(self.vadas_model.div) < 1e-9:
-            return None
+            return np.full_like(rd_array, np.nan) # Return NaN for all if div is zero
+
+        theta = np.where(self.vadas_model.s != 0, rd_array / self.vadas_model.s, rd_array)
         
-        theta = rd / self.vadas_model.s if self.vadas_model.s != 0 else rd
-        
+        converged_mask = np.zeros_like(rd_array, dtype=bool)
+
         for _ in range(max_iter):
             xd = theta * self.vadas_model.s
             poly_val = self._poly_eval(self.vadas_model.k, xd)
             poly_deriv = self._poly_deriv_eval(self.vadas_model.k, xd)
             
-            if abs(poly_deriv * self.vadas_model.s) < 1e-9:
-                break
+            unstable_deriv_mask = np.abs(poly_deriv * self.vadas_model.s) < 1e-9
             
             rd_pred = poly_val / self.vadas_model.div
-            error = rd_pred - rd
+            error = rd_pred - rd_array
             
-            if abs(error) < 1e-6:
+            current_converged = np.abs(error) < 1e-6
+            converged_mask = converged_mask | current_converged | unstable_deriv_mask
+
+            update_mask = ~converged_mask
+            if not np.any(update_mask):
                 break
+
+            theta_update = np.zeros_like(theta)
+            theta_update[update_mask] = error[update_mask] / (poly_deriv[update_mask] * self.vadas_model.s / self.vadas_model.div)
             
-            theta_update = error / (poly_deriv * self.vadas_model.s / self.vadas_model.div)
             theta = theta - theta_update
-            theta = max(0, min(math.pi, theta))
-        
-        return theta if 0 <= theta <= math.pi else None
+            theta = np.clip(theta, 0, math.pi)
+
+        theta = np.where((theta >= 0) & (theta <= math.pi), theta, np.nan)
+        return theta
     
-    def _poly_eval(self, coeffs: List[float], x: float) -> float:
-        """다항식 계산"""
-        result = 0.0
+    def _poly_eval(self, coeffs: List[float], x: np.ndarray) -> np.ndarray:
+        """다항식 계산 (벡터화)"""
+        result = np.zeros_like(x, dtype=np.float64)
         for c in reversed(coeffs):
             result = result * x + c
         return result
     
-    def _poly_deriv_eval(self, coeffs: List[float], x: float) -> float:
-        """다항식 도함수 계산"""
+    def _poly_deriv_eval(self, coeffs: List[float], x: np.ndarray) -> np.ndarray:
+        """다항식 도함수 계산 (벡터화)"""
         if len(coeffs) <= 1:
-            return 0.0
+            return np.zeros_like(x, dtype=np.float64)
         
-        result = 0.0
+        result = np.zeros_like(x, dtype=np.float64)
         for i, c in enumerate(reversed(coeffs[1:]), 1):
             result = result * x + c * i
         return result
     
-    def _pinhole_unproject_approximate(self, u_coords: np.ndarray, v_coords: np.ndarray, depths: np.ndarray) -> List[np.ndarray]:
-        """표준 핀홀 카메라 모델을 사용한 근사 역투영"""
-        points_3d = []
-        
+    def _pinhole_unproject_approximate(self, u_coords: np.ndarray, v_coords: np.ndarray, depths: np.ndarray) -> np.ndarray:
+        """표준 핀홀 카메라 모델을 사용한 근사 역투영 (벡터화)"""
         fx = fy = 1000.0
         cx = self.image_size[0] / 2
         cy = self.image_size[1] / 2
         
-        for u, v, depth in zip(u_coords, v_coords, depths):
-            x = (u - cx) * depth / fx
-            y = (v - cy) * depth / fy
-            z = depth
-            points_3d.append(np.array([z, x, y]))
+        x = (u_coords - cx) * depths / fx
+        y = (v_coords - cy) * depths / fy
+        z = depths
+        
+        points_3d = np.stack([z, x, y], axis=-1)
         
         return points_3d
 
@@ -286,7 +284,7 @@ class Interactive3DDepthViewer:
         try:
             img = cv2.imread(str(file_path), cv2.IMREAD_UNCHANGED)
             if img is None:
-                print(f"Error: Could not load image from {file_path}")
+                print(f"Error: load_depth_map_png - Could not load image from {file_path}. Image is None.")
                 return None
             
             if img.dtype != np.uint16:
@@ -296,7 +294,7 @@ class Interactive3DDepthViewer:
             # 실제 이미지 크기로 VADAS 모델 업데이트
             actual_size = (img.shape[1], img.shape[0])
             if self.vadas_converter.image_size != actual_size:
-                print(f"이미지 크기 업데이트: {self.vadas_converter.image_size} -> {actual_size}")
+                print(f"[DEBUG] Image size mismatch. Updating VADAS converter: {self.vadas_converter.image_size} -> {actual_size}")
                 vadas_intrinsic = DEFAULT_CALIB['a6']['intrinsic']
                 self.vadas_converter = VADASDepthMapConverter(
                     vadas_intrinsic, 
@@ -307,14 +305,14 @@ class Interactive3DDepthViewer:
             depth_map_pixels = np.array(img, dtype=np.float32)
             depth_map_meters = depth_map_pixels / 256.0
             
-            print(f"깊이 맵 로드 완료:")
+            print(f"깊이 맵 로드 완료: {file_path}")
             print(f"  크기: {actual_size}")
             print(f"  깊이 범위: {depth_map_meters[depth_map_meters > 0].min():.2f} ~ {depth_map_meters.max():.2f} m")
             
             return depth_map_meters
             
         except Exception as e:
-            print(f"PNG 깊이 맵 로드 중 오류: {e}")
+            print(f"Error: load_depth_map_png - An exception occurred while loading PNG depth map from {file_path}: {e}")
             return None
 
     # === Interactive3DDepthViewer.load_original_pcd 수정 ===
@@ -432,7 +430,7 @@ class Interactive3DDepthViewer:
         print("=== 고급 VADAS 인터랙티브 뷰어 ===")
         
         class VADASAdvancedViewer:
-            def __init__(self, parent):
+            def __init__(self, parent, max_depth: float):
                 self.parent = parent
                 self.vis = o3d.visualization.VisualizerWithKeyCallback()
                 self.depth_map = None
@@ -440,12 +438,24 @@ class Interactive3DDepthViewer:
                 self.original_pcd = None
                 self.coordinate_frame = None
                 self.scaled_depth_pcd = None # 스케일 보정된 Depth PCD
+                self.max_depth = max_depth # Store max_depth
                 
                 # 표시 상태
                 self.show_vadas = True
                 self.show_original = True
                 self.show_coordinate = True
-                self.show_scaled_depth = True # 스케일 보정된 Depth PCD 표시 상태
+                self.show_scaled_depth = False # 스케일 보정된 Depth PCD 표시 상태
+                
+                # 컬러맵 세트 정의
+                self.colormap_sets = [
+                    # Set 0: Default uniform colors
+                    {'name': 'Uniform Colors', 'vadas': lambda x: np.array([1, 0, 0]), 'scaled': lambda x: np.array([0, 1, 0]), 'original': lambda x: np.array([0.7, 0.7, 0.7])},
+                    # Set 1: Gradient colors (Jet, Viridis, Plasma)
+                    {'name': 'Gradient Set 1 (Jet, Viridis, Plasma)', 'vadas': plt.cm.jet, 'scaled': plt.cm.viridis, 'original': plt.cm.plasma},
+                    # Set 2: Gradient colors (Magma, Cividis, Greys)
+                    {'name': 'Gradient Set 2 (Magma, Cividis, Greys)', 'vadas': plt.cm.magma, 'scaled': plt.cm.cividis, 'original': plt.cm.Greys},
+                ]
+                self.current_colormap_set_idx = 0
                 
             def toggle_vadas(self, vis):
                 print(f"VADAS PCD 토글: {'OFF' if self.show_vadas else 'ON'}")
@@ -502,6 +512,61 @@ class Interactive3DDepthViewer:
                     opt.background_color = np.asarray([0.1, 0.1, 0.1])
                     print("배경: 어두운색")
                 return False
+            
+            def _apply_colormap_to_pcd(self, pcd: o3d.geometry.PointCloud, colormap_func, min_depth: float, max_depth: float):
+                if pcd is None or not pcd.has_points():
+                    return
+
+                points = np.asarray(pcd.points)
+                distances = np.linalg.norm(points, axis=1)
+                normalized_depth = (distances - min_depth) / (max_depth - min_depth)
+                normalized_depth = np.clip(normalized_depth, 0, 1)
+
+                normalized_depth = np.clip(normalized_depth, 0, 1)
+
+                # Check if colormap_func is a matplotlib colormap instance
+                if isinstance(colormap_func, colors.Colormap):
+                    colors_array = colormap_func(normalized_depth)[:, :3]
+                elif callable(colormap_func):
+                    # It's a custom callable (e.g., a lambda for uniform color)
+                    # Assume it returns a single color (RGB or RGBA)
+                    single_color = np.asarray(colormap_func(0)) # Pass a dummy value, as it's for uniform color
+                    if single_color.shape == (): # If it returns a scalar, assume grayscale
+                        single_color = np.array([single_color, single_color, single_color])
+                    elif single_color.shape == (4,): # If it returns RGBA, take RGB
+                        single_color = single_color[:3]
+                    
+                    colors_array = np.tile(single_color, (len(points), 1))
+                else:
+                    # Fallback for unexpected colormap_func type, e.g., just use a default color
+                    colors_array = np.tile(np.array([0.5, 0.5, 0.5]), (len(points), 1)) # Grey fallback
+                
+                pcd.colors = o3d.utility.Vector3dVector(colors_array)
+                self.vis.update_geometry(pcd)
+                self.vis.update_renderer()
+                
+            def cycle_colormaps(self, vis):
+                self.current_colormap_set_idx = (self.current_colormap_set_idx + 1) % len(self.colormap_sets)
+                current_set = self.colormap_sets[self.current_colormap_set_idx]
+                print(f"컬러맵 세트 변경: {current_set['name']}")
+
+                max_depth_val = self.max_depth
+                min_depth_val = 0.1 # Hardcoded in depth_map_to_point_cloud, so use it here too.
+
+                # Apply to VADAS PCD
+                if self.vadas_pcd is not None:
+                    self._apply_colormap_to_pcd(self.vadas_pcd, current_set['vadas'], min_depth=min_depth_val, max_depth=max_depth_val)
+                
+                # Apply to Scaled Depth PCD
+                if self.scaled_depth_pcd is not None:
+                    self._apply_colormap_to_pcd(self.scaled_depth_pcd, current_set['scaled'], min_depth=min_depth_val, max_depth=max_depth_val)
+
+                # Apply to Original PCD
+                if self.original_pcd is not None:
+                    self._apply_colormap_to_pcd(self.original_pcd, current_set['original'], min_depth=min_depth_val, max_depth=max_depth_val)
+                
+                vis.update_renderer()
+                return False
                 
             def run(self):
                 # 데이터 로드
@@ -513,13 +578,13 @@ class Interactive3DDepthViewer:
                 # 윈도우 생성
                 self.vis.create_window("Advanced VADAS 3D Viewer", width=1800, height=1000)
                 
-                # 키 콜백 등록
                 self.vis.register_key_callback(ord("1"), self.toggle_vadas)
                 self.vis.register_key_callback(ord("2"), self.toggle_original)
                 self.vis.register_key_callback(ord("3"), self.toggle_scaled_depth) # 새 토글
                 self.vis.register_key_callback(ord("C"), self.toggle_coordinate)
                 self.vis.register_key_callback(ord("R"), self.reset_view)
                 self.vis.register_key_callback(ord("B"), self.change_background)
+                self.vis.register_key_callback(ord("5"), self.cycle_colormaps) # New callback
                 
                 # VADAS PCD 생성 및 추가
                 print("VADAS PCD 생성 중 (전체 해상도)...")
@@ -528,7 +593,7 @@ class Interactive3DDepthViewer:
                     downsample_factor=1, use_vadas_unprojection=True
                 )
                 if self.vadas_pcd.has_points():
-                    self.vadas_pcd.paint_uniform_color([1, 0, 0])  # 빨간색
+                    self._apply_colormap_to_pcd(self.vadas_pcd, self.colormap_sets[self.current_colormap_set_idx]['vadas'], min_depth=0.1, max_depth=max_depth) # Apply initial colormap
                     self.vis.add_geometry(self.vadas_pcd)
                     print(f"VADAS PCD 추가: {len(self.vadas_pcd.points)} 포인트")
                 
@@ -536,23 +601,31 @@ class Interactive3DDepthViewer:
                 if pcd_path:
                     self.original_pcd = self.parent.load_original_pcd(pcd_path)
                     if self.original_pcd is not None:
-                        self.original_pcd.paint_uniform_color([0.7, 0.7, 0.7])  # 회색
+                        # Apply initial colormap for original PCD
+                        self._apply_colormap_to_pcd(self.original_pcd, self.colormap_sets[self.current_colormap_set_idx]['original'], min_depth=0.1, max_depth=max_depth)
                         self.vis.add_geometry(self.original_pcd)
                         print(f"원본 PCD 추가: {len(self.original_pcd.points)} 포인트")
                 
                 # 스케일 보정된 Depth PCD 로드 및 추가
                 if self.parent.scaled_depth_path:
-                    print("스케일 보정된 Depth PCD 생성 중...")
+                    print(f"[DEBUG] Attempting to load scaled depth map from: {self.parent.scaled_depth_path}")
                     scaled_depth_map = self.parent.load_depth_map_png(self.parent.scaled_depth_path)
                     if scaled_depth_map is not None:
+                        print("스케일 보정된 Depth PCD 생성 중...")
                         self.scaled_depth_pcd = self.parent.vadas_converter.depth_map_to_point_cloud(
                             scaled_depth_map, max_depth=max_depth,
                             downsample_factor=1, use_vadas_unprojection=True
                         )
                         if self.scaled_depth_pcd.has_points():
-                            self.scaled_depth_pcd.paint_uniform_color([0, 1, 0]) # 초록색
-                            # self.vis.add_geometry(self.scaled_depth_pcd) # 이 줄을 제거
+                            self._apply_colormap_to_pcd(self.scaled_depth_pcd, self.colormap_sets[self.current_colormap_set_idx]['scaled'], min_depth=0.1, max_depth=max_depth) # Apply initial colormap
+                            self.vis.add_geometry(self.scaled_depth_pcd)
                             print(f"스케일 보정된 Depth PCD 추가: {len(self.scaled_depth_pcd.points)} 포인트")
+                        else:
+                            print("스케일 보정된 Depth PCD에 포인트가 없습니다.")
+                    else:
+                        print("스케일 보정된 Depth 맵 로드 실패 (scaled_depth_map is None).")
+                else:
+                    print("scaled_depth_path가 설정되지 않았습니다. 스케일 보정된 Depth PCD를 로드하지 않습니다.")
                 
                 # 좌표계 추가
                 self.coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=4.0)
@@ -575,6 +648,7 @@ class Interactive3DDepthViewer:
                 print("1: VADAS PCD 토글 (빨간색)")
                 print("2: 원본 PCD 토글 (회색)")
                 print("3: 스케일 보정된 Depth PCD 토글 (초록색)")
+                print("5: 컬러맵 세트 변경 (각 PCD별 다른 컬러맵)") # UPDATED
                 print("C: 좌표계 토글")
                 print("R: 뷰 리셋")
                 print("B: 배경색 변경")
@@ -586,7 +660,7 @@ class Interactive3DDepthViewer:
                 self.vis.run()
                 self.vis.destroy_window()
         
-        viewer = VADASAdvancedViewer(self)
+        viewer = VADASAdvancedViewer(self, max_depth=max_depth)
         viewer.run()
 
     def show_transform_comparison_viewer(
@@ -779,12 +853,28 @@ def main():
     
     depth_map_path = os.path.join(base_path, "depth_maps", pcd_filename.replace(".pcd", ".png"))
     pcd_path = os.path.join(base_path, "pcd", pcd_filename)
+
+    # scaled_depth_path 기본값 설정 (명시되지 않은 경우)
+    if args.scaled_depth_path is None:
+        # 현재 스크립트 파일의 디렉토리 (프로젝트 루트)를 기준으로 output 폴더의 특정 파일을 기본값으로 설정
+        default_scaled_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "output", "distribution_analysis_0000000931", "matched_depth_0000000931.png"
+        )
+        args.scaled_depth_path = default_scaled_path
+        print(f"[INFO] --scaled_depth_path가 설정되지 않아 기본값으로 설정되었습니다: {args.scaled_depth_path}")
     
     # 파일 존재 확인
     if not os.path.exists(depth_map_path):
         print(f"Depth map 파일을 찾을 수 없습니다: {depth_map_path}")
         sys.exit(1)
     
+    print(f"--- [DEBUG] Main Function Paths ---")
+    print(f"  Resolved Depth Map Path: {depth_map_path}")
+    print(f"  Resolved PCD File Path: {pcd_path}")
+    print(f"  Scaled Depth Path Argument: {args.scaled_depth_path}")
+    print(f"-----------------------------------")
+
     print(f"Depth Map: {depth_map_path}")
     print(f"PCD File: {pcd_path if os.path.exists(pcd_path) else '없음'}")
     print(f"다운샘플링: {'없음 (전체 해상도)' if args.downsample == 1 else f'{args.downsample}x'}")
