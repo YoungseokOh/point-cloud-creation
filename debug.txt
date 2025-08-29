@@ -1,48 +1,28 @@
-[INFO] 깊이 맵 로드 중: C:\Users\seok436\Documents\VSCode\Projects\point-cloud-creation\point-cloud-creation\output\fisheye_da_931_results\output.raw.npy
-[INFO] 카메라 파라미터: fx=1000.0, fy=1000.0, cx=960.0, cy=768.0
-[INFO] 깊이 맵 해상도: 644x518
-[INFO] 3D 포인트 클라우드 생성 중...
-[INFO] 포인트 클라우드 노멀 추정 중...
-[INFO] Poisson Surface Reconstruction 수행 중 (depth=9)...
-[Open3D DEBUG] Input Points / Samples: 332979 / 103902
-[Open3D DEBUG] #   Got kernel density: 0.046000003814697266 (s), 157.609375 (MB) / 157.609375 (MB) / 160 (MB)
-[Open3D DEBUG] #     Got normal field: 0.15599989891052246 (s), 193.43359375 (MB) / 193.43359375 (MB) / 193 (MB)
-[Open3D DEBUG] Point weight / Estimated Area: 2.717025e-06 / 9.047121e-01
-[Open3D DEBUG] #       Finalized tree: 0.18999981880187988 (s), 233.19140625 (MB) / 233.19140625 (MB) / 242 (MB)
-[Open3D DEBUG] #  Set FEM constraints: 0.23000001907348633 (s), 214.86328125 (MB) / 233.19140625 (MB) / 242 (MB)
-[Open3D DEBUG] #Set point constraints: 0.09399986267089844 (s), 204.0234375 (MB) / 233.19140625 (MB) / 242 (MB)
-[Open3D DEBUG] Leaf Nodes / Active Nodes / Ghost Nodes: 1058632 / 1186688 / 23177
-[Open3D DEBUG] Memory Usage: 204.027 MB
-Cycle[0] Depth[0/9]:    Updated constraints / Got system / Solved in:  0.001 /  0.000 /  0.000  (210.828 MB)    Nodes: 8
-CG: 4.5637e-01 -> 4.5637e-01 -> 1.3239e-05 (2.9e-05) [2008810819]
-Cycle[0] Depth[1/9]:    Updated constraints / Got system / Solved in:  0.001 /  0.000 /  0.000  (210.895 MB)    Nodes: 27
-  GS: 6.3713e-01 -> 6.3713e-01 -> 2.6572e-04 (4.2e-04) [8]
-Cycle[0] Depth[2/9]:    Updated constraints / Got system / Solved in:  0.001 /  0.000 /  0.001  (210.988 MB)    Nodes: 125
-    GS: 1.0087e+00 -> 1.0087e+00 -> 1.0772e-02 (1.1e-02) [8]
-Cycle[0] Depth[3/9]:    Updated constraints / Got system / Solved in:  0.002 /  0.002 /  0.000  (211.258 MB)    Nodes: 729
-      GS: 1.2046e+00 -> 1.2046e+00 -> 1.2927e-02 (1.1e-02) [8]
-Cycle[0] Depth[4/9]:    Updated constraints / Got system / Solved in:  0.001 /  0.007 /  0.000  (212.055 MB)    Nodes: 4913
-        GS: 1.1955e+00 -> 1.1955e+00 -> 7.5709e-03 (6.3e-03) [8]
-Cycle[0] Depth[5/9]:    Updated constraints / Got system / Solved in:  0.002 /  0.013 /  0.010  (214.430 MB)    Nodes: 35937
-          GS: 1.2111e+00 -> 1.2111e+00 -> 4.7418e-03 (3.9e-03) [8]
-Cycle[0] Depth[6/9]:    Updated constraints / Got system / Solved in:  0.002 /  0.025 /  0.021  (216.281 MB)    Nodes: 45544
-            GS: 1.2200e+00 -> 1.2200e+00 -> 7.1137e-03 (5.8e-03) [8]
-Cycle[0] Depth[7/9]:    Updated constraints / Got system / Solved in:  0.004 /  0.024 /  0.041  (219.922 MB)    Nodes: 131120
-              GS: 1.1096e+00 -> 1.1096e+00 -> 3.8056e-03 (3.4e-03) [8]
-Cycle[0] Depth[8/9]:    Updated constraints / Got system / Solved in:  0.009 /  0.052 /  0.113  (228.414 MB)    Nodes: 337640
-                GS: 8.2701e-01 -> 8.2701e-01 -> 6.2241e-03 (7.5e-03) [8]
-Cycle[0] Depth[9/9]:    Updated constraints / Got system / Solved in:  0.006 /  0.104 /  0.141  (234.125 MB)    Nodes: 604088
-                  GS: 3.9054e-01 -> 3.9054e-01 -> 6.4300e-03 (1.6e-02) [8]
-[Open3D DEBUG] # Linear system solved: 0.7750000953674316 (s), 234.125 (MB) / 234.125 (MB) / 242 (MB)
-[Open3D DEBUG] Got average: 0.009999990463256836 (s), 202.98046875 (MB) / 234.125 (MB) / 242 (MB)
-[Open3D DEBUG] Iso-Value: 5.013446e-01 = 1.669372e+05 / 3.329790e+05
-[Open3D DEBUG] #          Total Solve:       2.7 (s),     287.4 (MB)
-[INFO] Mesh 저장 중: C:\Users\seok436\Documents\VSCode\Projects\point-cloud-creation\point-cloud-creation\output\generated_mesh\depth_anything_mesh.ply
-[INFO] Mesh 생성 및 저장 완료.
-[INFO] 시각화 시작. 이미지: C:\Users\seok436\Documents\VSCode\Projects\point-cloud-creation\point-cloud-creation\output\fisheye_da_931_results\output.raw.png
+--- Starting Depth Anything + VADAS Pipeline Example ---
+[DEBUG_VIZ] Displaying: 1. Fisheye Input Image
+  - Saved intermediate image to: ./output/debug_viz/1._Fisheye_Input_Image.png
+Length of intrinsic: 18
+[DEBUG] VADAS Model Intrinsics - k: [-0.0004, 1.0136, -0.0623, 0.2852, -0.332, 0.1896, -0.0391], s: 1.0447, div: 0.0021, ux: 44.9516, uy: 2.48822, d2u_k: [0, 0.9965, -0.0067, -0.0956, 0.1006, -0.054, 0.0106]
+[SAVE] Undistorted (large canvas, centered) -> ./output/debug_viz/undistorted_large_canvas.png
+[STEP] Loading pre-computed Depth Map from C:\Users\seok436\Documents\VSCode\Projects\point-cloud-creation\point-cloud-creation\output\u2d_test.raw.npy
+[DEBUG] Loaded Depth Map Shape: (1536, 1920)
+[DEBUG_VIZ] Displaying: 3. Depth Map (from .npy)
+  - Saved intermediate image to: ./output/debug_viz/3._Depth_Map_(from_.npy).png
+[STEP] Undistorted Depth -> Distorted Depth conversion
+[DEBUG_U2D] rd - Min: 0.0010, Max: 2.6593, Mean: 1.3957
+[DEBUG_U2D] d2u_k: [0, 0.9965, -0.0067, -0.0956, 0.1006, -0.054, 0.0106]
+[DEBUG_U2D] xd loop 0 - c: 0.0106, xd Min: 0.0106, Max: 0.0106, Mean: 0.0106
+[DEBUG_U2D] xd loop 1 - c: -0.0540, xd Min: -0.0540, Max: -0.0258, Mean: -0.0392
+[DEBUG_U2D] xd loop 2 - c: 0.1006, xd Min: 0.0318, Max: 0.1005, Mean: 0.0489
+[DEBUG_U2D] xd loop 3 - c: -0.0956, xd Min: -0.0955, Max: -0.0106, Mean: -0.0347
+[DEBUG_U2D] xd loop 4 - c: -0.0067, xd Min: -0.0579, Max: -0.0068, Mean: -0.0494
+[DEBUG_U2D] xd loop 5 - c: 0.9965, xd Min: 0.8704, Max: 0.9965, Mean: 0.9238
+[DEBUG_U2D] xd loop 6 - c: 0.0000, xd Min: 0.0010, Max: 2.4031, Mean: 1.2714
 Traceback (most recent call last):
-  File "C:\Users\seok436\Documents\VSCode\Projects\point-cloud-creation\point-cloud-creation\depth_to_mesh_and_visualize.py", line 199, in <module>
-    visualize_mesh_and_image(generated_mesh, raw_png_path)
-  File "C:\Users\seok436\Documents\VSCode\Projects\point-cloud-creation\point-cloud-creation\depth_to_mesh_and_visualize.py", line 115, in visualize_mesh_and_image
-    if mesh.has_normals():
-AttributeError: 'open3d.cpu.pybind.geometry.TriangleMesh' object has no attribute 'has_normals'
+  File "C:\Users\seok436\Documents\VSCode\Projects\point-cloud-creation\point-cloud-creation\integrated_pipeline.py", line 808, in <module>
+    integrated_pipeline_example(debug_interactive=False)
+  File "C:\Users\seok436\Documents\VSCode\Projects\point-cloud-creation\point-cloud-creation\integrated_pipeline.py", line 782, in integrated_pipeline_example
+    distorted_depth_image = undistort_to_distort(
+  File "C:\Users\seok436\Documents\VSCode\Projects\point-cloud-creation\point-cloud-creation\integrated_pipeline.py", line 402, in undistort_to_distort
+    max_xd_for_theta = (np.pi / 2 - 1e-3) * s_poly
+UnboundLocalError: local variable 's_poly' referenced before assignment

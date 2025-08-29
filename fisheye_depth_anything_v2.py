@@ -45,8 +45,12 @@ def run_depth_anything_v2(rgb_pil,
     d01 = (d - d.min()) / (d.max() - d.min() + 1e-8)
 
     # raw 텐서는 (1,H,W) 모양이 일반적이므로 맞춰서 반환
-    raw_depth = outputs["predicted_depth"] if isinstance(outputs, dict) else outputs.predicted_depth
-    return d01.cpu().numpy(), raw_depth
+    # raw_depth_tensor를 post_process_depth_estimation을 거친 'post' 변수로 대체
+    # 'post'는 이미 원본 이미지 크기로 조정되어 있습니다.
+    # save_depth_products에서 (1, H, W) 형태를 기대하므로 unsqueeze(0)를 해줍니다.
+    raw_depth_tensor_resized = post.unsqueeze(0)
+    print(f"[DEBUG] Raw Depth Tensor Shape (after resize to original): {raw_depth_tensor_resized.shape}")
+    return d01.cpu().numpy(), raw_depth_tensor_resized
 
 def save_depth_products(depth01, out_prefix, raw_depth_tensor=None):
     """

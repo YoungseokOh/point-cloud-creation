@@ -311,7 +311,7 @@ def distort_to_undistort(image: np.ndarray,
         raise ValueError("Invalid pixel_size (div) in VADAS intrinsic.")
     f_base = s / div
 
-    def build_maps(curr_zoom: float) -> Tuple[np.ndarray, np.ndarray, float, float, float, float]:
+    def build_maps(curr_zoom: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]: # K도 반환하도록 수정
         fx = max(f_base / max(curr_zoom, 1e-6), 1e-6)
         fy = fx
         cx = W_rect / 2.0
@@ -325,10 +325,10 @@ def distort_to_undistort(image: np.ndarray,
             rectified_size=(W_rect, H_rect),
             rectified_K=K
         )
-        return mx, my, fx, fy, cx, cy
+        return mx, my, K # K도 반환
 
     # 초기 맵 생성
-    map_x, map_y, fx, fy, cx, cy = build_maps(zoom)
+    map_x, map_y, K_current = build_maps(zoom) # K_current를 받도록 수정
 
     # 원본(fisheye) 픽셀 커버리지 최대화 (옵션)
     if auto_cover_all:
@@ -336,7 +336,7 @@ def distort_to_undistort(image: np.ndarray,
         it = 0
         while (src_cov_ratio < target_source_coverage) and (it < max_iters):
             zoom *= zoom_step  # 더 줌아웃
-            map_x, map_y, fx, fy, cx, cy = build_maps(zoom)
+            map_x, map_y, K_current = build_maps(zoom)
             src_cov_ratio, _ = _compute_source_coverage(map_x, map_y, (W_orig, H_orig))
             it += 1
             if debug_mode:
@@ -355,20 +355,105 @@ def distort_to_undistort(image: np.ndarray,
         valid_mask = ((map_x >= 0) & (map_y >= 0)).astype(np.uint8)
         src_cov_ratio, _ = _compute_source_coverage(map_x, map_y, (W_orig, H_orig))
         print(f"[LDC] rectified={W_rect}x{H_rect} zoom={zoom:.3f} rect_valid_ratio={valid_mask.mean():.3f} src_coverage={src_cov_ratio:.3f}")
-        return undistorted, valid_mask
+        return undistorted, valid_mask, K_current
 
-    return undistorted, None
+    return undistorted, None, K_current
 
-def undistort_to_distort(image: np.ndarray, vadas_model: VADASFisheyeCameraModel, debug_mode: bool = False) -> np.ndarray:
+def undistort_to_distort(
+    undistorted_depth: np.ndarray,
+    vadas_model: VADASFisheyeCameraModel,
+    distorted_size: Tuple[int, int],
+    pinhole_K: np.ndarray,
+    original_fisheye_image_size: Tuple[int, int]
+) -> np.ndarray:
     """
-    Undistorted Image -> Distorted Image (VADAS Model)
+    Undistorted Depth -> Distorted Depth using d2u parameters (backward mapping).
     """
-    print("[STEP] Undistorted -> Distorted conversion (Placeholder)")
-    # Placeholder: This would use backward mapping from fisheye_backward_mapping_image_sweep.py
-    # For now, return a dummy distorted image.
-    H, W, _ = image.shape
-    distorted_image = cv.resize(image, (W, H), interpolation=cv.INTER_LINEAR) # Just a resized copy for now
-    return distorted_image
+    print("[STEP] Undistorted Depth -> Distorted Depth conversion")
+    W_dist, H_dist = distorted_size
+    W_orig, H_orig = original_fisheye_image_size
+
+    # Get s_poly early in the function scope
+    s_poly = vadas_model.s
+    if abs(s_poly) < 1e-9:
+        s_poly = 1.0
+
+    # Create grid for the distorted (fisheye) image
+    u_fish_grid, v_fish_grid = np.meshgrid(np.arange(W_dist, dtype=np.float32), np.arange(H_dist, dtype=np.float32))
+
+    # Center the coordinates based on intrinsic parameters
+    ux = vadas_model.ux
+    uy = vadas_model.uy
+    img_w_half = W_orig / 2.0
+    img_h_half = H_orig / 2.0
+    u_centered = u_fish_grid - ux - img_w_half
+    v_centered = v_fish_grid - uy - img_h_half
+
+    # Calculate radius in the distorted image
+    rd = np.hypot(u_centered, v_centered)
+    rd *= vadas_model.div  # Scale by pixel size
+    print(f"[DEBUG_U2D] rd - Min: {np.min(rd):.4f}, Max: {np.max(rd):.4f}, Mean: {np.mean(rd):.4f}")
+
+    # Apply d2u polynomial to map radius (rd) to distorted radius (xd)
+    xd = np.zeros_like(rd, dtype=np.float64)
+    if vadas_model.d2u_k:
+        print(f"[DEBUG_U2D] d2u_k: {vadas_model.d2u_k}") # d2u_k 계수 출력
+        for i, c in enumerate(reversed(vadas_model.d2u_k)):
+            xd = xd * rd + c
+            print(f"[DEBUG_U2D] xd loop {i} - c: {c:.4f}, xd Min: {np.min(xd):.4f}, Max: {np.max(xd):.4f}, Mean: {np.mean(xd):.4f}") # 중간 값 출력
+    
+    # xd를 클리핑하여 theta가 pi/2를 넘지 않도록 합니다.
+    # theta = xd / s_poly 이므로, xd <= (pi/2 - epsilon) * s_poly
+    s_poly = vadas_model.s
+    max_xd_for_theta = (np.pi / 2 - 1e-3) * s_poly
+    xd = np.clip(xd, 0, max_xd_for_theta)
+    print(f"[DEBUG_U2D] xd (clipped) - Min: {np.min(xd):.4f}, Max: {np.max(xd):.4f}, Mean: {np.mean(xd):.4f}")
+    
+    # Get theta from xd
+    
+    if abs(s_poly) < 1e-9:
+        s_poly = 1.0
+    theta = xd / s_poly
+    # theta 클리핑은 xd 클리핑으로 인해 이미 적절한 범위에 있을 것입니다.
+    # 하지만 혹시 모를 부동소수점 오류를 위해 유지합니다.
+    theta = np.clip(theta, 1e-6, np.pi - 1e-3)
+    print(f"[DEBUG_U2D] theta - Min: {np.min(theta):.4f}, Max: {np.max(theta):.4f}, Mean: {np.mean(theta):.4f}")
+
+    # Backproject to normalized pinhole camera plane
+    dist = np.tan(theta)
+    print(f"[DEBUG_U2D] dist - Min: {np.min(dist):.4f}, Max: {np.max(dist):.4f}, Mean: {np.mean(dist):.4f}")
+    
+    eps = np.finfo(np.float32).eps
+    rd_safe = np.where(rd < eps, eps, rd)
+    cosPhi = u_centered / rd_safe
+    sinPhi = v_centered / rd_safe
+
+    # Coordinates on the normalized plane (z=1) of the pinhole camera
+    nx = dist * cosPhi
+    ny = dist * sinPhi
+    print(f"[DEBUG_U2D] nx - Min: {np.min(nx):.4f}, Max: {np.max(nx):.4f}, Mean: {np.mean(nx):.4f}")
+    print(f"[DEBUG_U2D] ny - Min: {np.min(ny):.4f}, Max: {np.max(ny):.4f}, Mean: {np.mean(ny):.4f}")
+
+    # Convert normalized coordinates to pixel coordinates in the undistorted image
+    fx, fy = pinhole_K[0, 0], pinhole_K[1, 1]
+    cx, cy = pinhole_K[0, 2], pinhole_K[1, 2]
+    
+    map_x = nx * fx + cx
+    map_y = ny * fy + cy
+    print(f"[DEBUG_U2D] map_x - Min: {np.min(map_x):.4f}, Max: {np.max(map_x):.4f}, Mean: {np.mean(map_x):.4f}")
+    print(f"[DEBUG_U2D] map_y - Min: {np.min(map_y):.4f}, Max: {np.max(map_y):.4f}, Mean: {np.mean(map_y):.4f}")
+
+    # Remap to create the distorted depth map
+    distorted_depth = cv.remap(
+        undistorted_depth,
+        map_x.astype(np.float32),
+        map_y.astype(np.float32),
+        interpolation=cv.INTER_LINEAR,
+        borderMode=cv.BORDER_CONSTANT,
+        borderValue=0  # Use 0 for areas with no corresponding depth
+    )
+    
+    return distorted_depth
 
 def run_depth_anything_v2(undistorted_image: np.ndarray, depth_anything_model: Any) -> np.ndarray:
     """
@@ -640,6 +725,7 @@ def integrated_pipeline_example(debug_interactive: bool = True):
     # Initialize VADAS model with original image size
     print(f"Length of intrinsic: {len(DEFAULT_CALIB['a6']['intrinsic'])}")
     vadas_model = VADASFisheyeCameraModel(DEFAULT_CALIB['a6']['intrinsic'], image_size=(input_image.shape[1], input_image.shape[0]))
+    print(f"[DEBUG] VADAS Model Intrinsics - k: {vadas_model.k}, s: {vadas_model.s}, div: {vadas_model.div}, ux: {vadas_model.ux}, uy: {vadas_model.uy}, d2u_k: {vadas_model.d2u_k}")
 
     # Step 1: Distorted -> Undistorted on a larger 'sketchbook' canvas
     H, W = input_image.shape[:2]
@@ -661,7 +747,7 @@ def integrated_pipeline_example(debug_interactive: bool = True):
             cache_steps=100        # 캐시 샘플 수(부드러움 조절)
         )
         # 인터랙티브 이후 기본 결과도 저장
-        undistorted_image, valid_mask = distort_to_undistort(
+        undistorted_image, valid_mask, K_current = distort_to_undistort(
             input_image,
             vadas_model,
             rectified_size=(W_rect, H_rect),  # 큰 캔버스
@@ -672,12 +758,12 @@ def integrated_pipeline_example(debug_interactive: bool = True):
         debug_visualization("2. Undistorted (Large Canvas, Centered)", undistorted_image, save_intermediate=True, output_dir="./output/debug_viz/")
     else:
         # Debug False: 기본 값으로 넓은 스케치북에 중앙점에 맞춘 결과를 저장
-        undistorted_image, _ = distort_to_undistort(
+        undistorted_image, _, K_current = distort_to_undistort(
             input_image,
             vadas_model,
             rectified_size=(W_rect, H_rect),  # 큰 캔버스
             debug_mode=False,
-            zoom=1.0,
+            zoom=0.15,
             auto_cover_all=True  # 가능한 많은 포인트를 포함 시도
         )
         os.makedirs("./output/debug_viz", exist_ok=True)
@@ -685,13 +771,28 @@ def integrated_pipeline_example(debug_interactive: bool = True):
         cv.imwrite(out_path, undistorted_image)
         print(f"[SAVE] Undistorted (large canvas, centered) -> {out_path}")
 
-    # Step 2: Run Depth Anything v2
-    depth_anything_model = None 
-    depth_map = run_depth_anything_v2(undistorted_image, depth_anything_model)
-    debug_visualization("3. Depth Map (from DA v2)", depth_map, save_intermediate=True, output_dir="./output/debug_viz/")
+    # Step 2: Load pre-computed Depth Map
+    depth_map_path = "C:\\Users\\seok436\\Documents\\VSCode\\Projects\\point-cloud-creation\\point-cloud-creation\\output\\u2d_test.raw.npy"
+    print(f"[STEP] Loading pre-computed Depth Map from {depth_map_path}")
+    depth_map = np.load(depth_map_path)
+    print(f"[DEBUG] Loaded Depth Map Shape: {depth_map.shape}")
+    # Depth Anything V2 결과는 일반적으로 0-1 범위로 정규화되어 있다고 가정합니다.
+    # 필요하다면 여기서 추가적인 정규화 또는 스케일링을 수행할 수 있습니다.
+    debug_visualization("3. Depth Map (from .npy)", depth_map, save_intermediate=True, output_dir="./output/debug_viz/")
 
     # Step 3: Undistorted Depth -> Distorted Depth
-    distorted_depth_image = undistort_to_distort(undistorted_image, vadas_model)
+    # undistorted_image를 생성할 때 사용된 K 행렬을 기반으로 pinhole_K를 재구성합니다.
+    # distort_to_undistort 함수에서 사용된 zoom 값을 가져와야 합니다.
+    pinhole_K_for_distort = K_current
+
+    distorted_depth_image = undistort_to_distort(
+        depth_map,
+        vadas_model,
+        distorted_size=(input_image.shape[1], input_image.shape[0]),
+        pinhole_K=pinhole_K_for_distort,
+        original_fisheye_image_size=(input_image.shape[1], input_image.shape[0])
+    )
+    print(f"[DEBUG] Distorted Depth Image - Min: {np.min(distorted_depth_image):.4f}, Max: {np.max(distorted_depth_image):.4f}, Mean: {np.mean(distorted_depth_image):.4f}")
     debug_visualization("4. Distorted Depth Image", distorted_depth_image, save_intermediate=True, output_dir="./output/debug_viz/")
 
     # Step 4: Crop in Normalized Plane (if normalized_plane_data was generated)
@@ -710,4 +811,4 @@ def integrated_pipeline_example(debug_interactive: bool = True):
 
 if __name__ == "__main__":
     # 디버그 모드: True일 때만 인터랙티브 뷰어 동작
-    integrated_pipeline_example(debug_interactive=True)
+    integrated_pipeline_example(debug_interactive=False)
