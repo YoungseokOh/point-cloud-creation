@@ -36,10 +36,43 @@ blue_marker_geometry = None
 last_blue_marker_pos = None
 BLUE_DEPTH_Z = -0.771
 
+# NEW: g yellow vertical segment (0,0,BLUE_DEPTH_Z) -> (0,0,z_purple)
+yellow_g_line_geometry = None
 # NEW: light-green line from blue point to the purple line at z=z_purple
 blue_to_purple_line_geometry = None
 # 선 연장 배율(>1이면 보라색 점을 넘어 연장)
 GREEN_EXTEND_FACTOR = 10.0
+
+# NEW: angle arc geometries (all black)
+arc_d_geometry = None  # arc for d = angle(a,b)
+arc_e_geometry = None  # arc for e = angle(c,b)
+arc_x_geometry = None  # arc for x = d - e
+# Toggle to draw angle arcs (off for now while validating 'd')
+DRAW_ANGLE_ARCS = False
+
+# NEW: circles in the (b,z) plane centered at blue point using radii along c
+c_circles_geometry = None
+# Previous method circles (ground plane) for comparison
+c_circles_prev_geometry = None
+NUM_C_RADII = 25            # 더 촘촘하게 링 생성
+CIRCLE_SEGS = 128
+SKIP_FAR_COUNT = 1         # 먼쪽(보라색점 방향)에서 N개 링 제거, 가까운 쪽은 살림
+RING_RADIUS_SCALE = 0.15
+RING_RADIUS_MIN = 0.02
+RING_RADIUS_MAX = 0.50
+NEAR_BIAS = 1.2
+MIN_FIRST_RADIUS = 0.01
+# NEW: radii distribution along c
+RADIUS_DISTRIBUTION = "cosine"  # 'uniform' | 'near' | 'cosine' (cosine: 양 끝이 더 촘촘)
+# NEW: options
+DRAW_PREV_CIRCLES = False   # 빨간색 방식은 비교를 위해 기본 끔(요청: 주석처리 대체)
+c_circles_pcd_geometry = None  # 원 포인트들을 모아 PCD로 표시
+XY_MIN_SEPARATION = 0.1
+# Ground grid (z=0) toggle
+ground_plane_geometry = None
+GROUND_SIZE_X = 20.0  # meters (extends to ±20m in X)
+GROUND_SIZE_Y = 20.0  # meters (extends to ±20m in Y)
+GROUND_STEP = 1.0     # grid spacing in meters
 
 def find_closest_line_by_euclidean_distance(
     pcd_original, # Now takes pcd_original directly
@@ -293,11 +326,13 @@ def update_visualization(vis_instance):
 
         # Update visualization
         if pcd_display_geometry is None:
-            pcd_display_geometry = display_pcd
+            pcd_display_geometry = o3d.geometry.PointCloud()
+            pcd_display_geometry.points = o3d.utility.Vector3dVector(np.asarray(display_pcd.points))
+            pcd_display_geometry.colors = o3d.utility.Vector3dVector(np.asarray(display_pcd.colors))
             vis_instance.add_geometry(pcd_display_geometry)
         else:
-            pcd_display_geometry.points = display_pcd.points
-            pcd_display_geometry.colors = display_pcd.colors
+            pcd_display_geometry.points = o3d.utility.Vector3dVector(np.asarray(display_pcd.points))
+            pcd_display_geometry.colors = o3d.utility.Vector3dVector(np.asarray(display_pcd.colors))
             vis_instance.update_geometry(pcd_display_geometry)
         
         if origin_sphere_geometry is None:
@@ -425,6 +460,250 @@ def update_visualization(vis_instance):
                 distance_line_geometry.lines = o3d.utility.Vector2iVector(dist_lines)
                 distance_line_geometry.colors = o3d.utility.Vector3dVector(np.array([[1.0, 0.0, 0.0]], dtype=np.float64))
                 vis_instance.update_geometry(distance_line_geometry)
+
+            # ===================== Metrics & Diagram Print =====================
+            # Define variables by color:
+            # a: red (origin → purple)
+            # b: magenta (base length on XY from origin to purple projected on z=const)
+            # f+g: blue total target height (configured)
+            # f: lower blue segment = |BLUE_DEPTH_Z|
+            # g: upper yellow segment = (f+g) - f
+
+            x_purple, y_purple, z_purple = float(selected_marker_pos[0]), float(selected_marker_pos[1]), float(selected_marker_pos[2])
+            a_len = float(np.linalg.norm(selected_marker_pos))
+            b_len = float(np.hypot(x_purple, y_purple))
+            blue_point_pos = np.array([0.0, 0.0, BLUE_DEPTH_Z], dtype=np.float64)
+
+            # Heights (dynamic)
+            f_lower = float(abs(BLUE_DEPTH_Z))                 # f
+            g_upper = float(abs(z_purple - BLUE_DEPTH_Z))      # g = |z_purple - BLUE_DEPTH_Z|
+            fg_total = float(f_lower + g_upper)                # f+g
+
+            # Draw/update g yellow vertical line at x=y=0
+            global yellow_g_line_geometry
+            g_start = np.array([0.0, 0.0, BLUE_DEPTH_Z], dtype=np.float64)
+            g_end = np.array([0.0, 0.0, z_purple], dtype=np.float64)
+            g_pts = np.stack([g_start, g_end], axis=0)
+            g_edges = np.array([[0, 1]], dtype=np.int32)
+            if yellow_g_line_geometry is None:
+                yellow_g_line_geometry = o3d.geometry.LineSet()
+                yellow_g_line_geometry.points = o3d.utility.Vector3dVector(g_pts)
+                yellow_g_line_geometry.lines = o3d.utility.Vector2iVector(g_edges)
+                yellow_g_line_geometry.colors = o3d.utility.Vector3dVector(np.array([[1.0, 1.0, 0.0]], dtype=np.float64))  # yellow
+                vis_instance.add_geometry(yellow_g_line_geometry)
+            else:
+                yellow_g_line_geometry.points = o3d.utility.Vector3dVector(g_pts)
+                yellow_g_line_geometry.lines = o3d.utility.Vector2iVector(g_edges)
+                yellow_g_line_geometry.colors = o3d.utility.Vector3dVector(np.array([[1.0, 1.0, 0.0]], dtype=np.float64))
+                vis_instance.update_geometry(yellow_g_line_geometry)
+
+            # Compute angles only (remove all arc drawings)
+            # a = vector OP (origin->purple), b = its XY projection, c = vector from blue point (0,0,BLUE_DEPTH_Z) to purple
+            c_vec = (selected_marker_pos - blue_point_pos).astype(np.float64)
+            c_len = float(np.linalg.norm(c_vec))
+
+            eps = 1e-9
+            if a_len > eps and b_len > eps:
+                # d = angle(a,b) = acos( b / |a| ) = atan2(f+g, b)
+                d_angle = float(np.degrees(np.arccos(np.clip(b_len / max(a_len, eps), -1.0, 1.0))))
+            else:
+                d_angle = 0.0
+
+            if c_len > eps and b_len > eps:
+                # e = angle(c,b) = acos( b / |c| ) = atan2(g, b)
+                e_angle = float(np.degrees(np.arccos(np.clip(b_len / max(c_len, eps), -1.0, 1.0))))
+            else:
+                e_angle = 0.0
+
+            x_angle = float(d_angle - e_angle)
+
+            # Remove any previously drawn arcs
+            global arc_d_geometry, arc_e_geometry, arc_x_geometry
+            if arc_d_geometry is not None:
+                vis_instance.remove_geometry(arc_d_geometry, reset_bounding_box=False)
+                arc_d_geometry = None
+            if arc_e_geometry is not None:
+                vis_instance.remove_geometry(arc_e_geometry, reset_bounding_box=False)
+                arc_e_geometry = None
+            if arc_x_geometry is not None:
+                vis_instance.remove_geometry(arc_x_geometry, reset_bounding_box=False)
+                arc_x_geometry = None
+
+            # NEW: draw/update circles on a plane tilted by c's slope (centered at blue point)
+            global c_circles_geometry, c_circles_prev_geometry, c_circles_pcd_geometry, NUM_C_RADII, CIRCLE_SEGS, SKIP_FAR_COUNT, XY_MIN_SEPARATION
+
+            if c_len > eps:
+                # Basis aligned to purple azimuth
+                u_b_xy = np.array([x_purple, y_purple, 0.0], dtype=np.float64)
+                if np.linalg.norm(u_b_xy) <= eps:
+                    u_b_xy = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+                else:
+                    u_b_xy /= np.linalg.norm(u_b_xy)
+                z_hat = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+                u_tan = np.cross(z_hat, u_b_xy)  # sideways, in XY
+
+                # Tilt to match c's slope along u_b direction
+                # slope = dz / dr along u_b
+                slope_c = float((z_purple - BLUE_DEPTH_Z) / max(b_len, eps))
+                u_elev = u_b_xy + slope_c * z_hat
+                u_elev /= max(np.linalg.norm(u_elev), eps)  # normalize
+
+                # Radii along c, skip near region
+                radii_along_c = build_radii_along_c_vals(c_len)
+
+                center = np.array([0.0, 0.0, BLUE_DEPTH_Z], dtype=np.float64)  # keep center at blue point
+                all_pts, all_lines, all_colors = [], [], []
+                pcd_pts_list = []  # X<=0 포인트만 모아 PCD 생성
+                # Build XY KD-tree of original PCD (z=0로 임베딩하여 XY거리 사용)
+                orig_xy_kdtree = None
+                _kd_pcd_xy = None
+                try:
+                    # 항상 원본 PCD에서 KDTree 구성 (디스플레이 버퍼와 분리)
+                    orig_pts = np.asarray(pcd_original.points)
+                    if orig_pts.size > 0:
+                        orig_xy = np.column_stack([orig_pts[:, 0], orig_pts[:, 1],
+                                                   np.zeros((orig_pts.shape[0],), dtype=np.float64)])
+                        _kd_pcd_xy = o3d.geometry.PointCloud()
+                        _kd_pcd_xy.points = o3d.utility.Vector3dVector(orig_xy.astype(np.float64))
+                        orig_xy_kdtree = o3d.geometry.KDTreeFlann(_kd_pcd_xy)
+                except Exception as _e:
+                    print(f"KDTree build failed: {_e}")
+
+                base_idx = 0
+                ts = np.linspace(0.0, 2.0 * np.pi, CIRCLE_SEGS, dtype=np.float64)
+                cos_t = np.cos(ts)[:, None]
+                sin_t = np.sin(ts)[:, None]
+
+                for r in radii_along_c:
+                    # 1) 보라색점을 지나는 원(r == c_len)은 그리지 않음
+                    if abs(r - c_len) <= max(1e-9, 1e-6 * c_len):
+                        continue
+
+                    # Circle in tilted plane spanned by (u_elev, u_tan) -> BLACK (current method)
+                    ring = center + r * (cos_t * u_elev + sin_t * u_tan)
+
+                    # 2) X>0 제거: X<=0인 점만 허용 (라인)
+                    all_pts.append(ring)
+                    idxs = np.arange(CIRCLE_SEGS, dtype=np.int32)
+                    nxts = (idxs + 1) % CIRCLE_SEGS
+                    valid = (ring[:, 0] <= 0.0)
+                    edge_mask = valid[idxs] & valid[nxts]
+                    if np.any(edge_mask):
+                        lines = np.column_stack(
+                            [base_idx + idxs[edge_mask], base_idx + nxts[edge_mask]]
+                        ).astype(np.int32)
+                        all_lines.append(lines)
+                        all_colors.append(np.tile([0.0, 0.0, 0.0], (lines.shape[0], 1)))  # black
+                    # 3) PCD용 포인트: X<=0 AND 기존 PCD와 XY거리 >= XY_MIN_SEPARATION
+                    ring_valid_pts = ring[valid]
+                    if ring_valid_pts.size > 0:
+                        if orig_xy_kdtree is not None:
+                            kept = []
+                            for p in ring_valid_pts:
+                                q = np.array([p[0], p[1], 0.0], dtype=np.float64)
+                                try:
+                                    k, _idx, _d2 = orig_xy_kdtree.search_radius_vector_3d(q, float(XY_MIN_SEPARATION))
+                                    if k == 0:
+                                        kept.append(p)
+                                except Exception:
+                                    kept.append(p)  # 안전하게 유지
+                            if kept:
+                                pcd_pts_list.append(np.asarray(kept, dtype=np.float64))
+                        else:
+                            pcd_pts_list.append(ring_valid_pts)
+                    base_idx += CIRCLE_SEGS
+
+                all_pts_np = np.vstack(all_pts) if all_pts else np.zeros((0, 3), dtype=np.float64)
+                all_lines_np = np.vstack(all_lines) if all_lines else np.zeros((0, 2), dtype=np.int32)
+                all_colors_np = np.vstack(all_colors) if all_colors else np.zeros((0, 3), dtype=np.float64)
+                if c_circles_geometry is None:
+                    c_circles_geometry = o3d.geometry.LineSet()
+                    c_circles_geometry.points = o3d.utility.Vector3dVector(all_pts_np)
+                    c_circles_geometry.lines = o3d.utility.Vector2iVector(all_lines_np)
+                    c_circles_geometry.colors = o3d.utility.Vector3dVector(all_colors_np)
+                    vis_instance.add_geometry(c_circles_geometry)
+                else:
+                    c_circles_geometry.points = o3d.utility.Vector3dVector(all_pts_np)
+                    c_circles_geometry.lines = o3d.utility.Vector2iVector(all_lines_np)
+                    c_circles_geometry.colors = o3d.utility.Vector3dVector(all_colors_np)
+                    vis_instance.update_geometry(c_circles_geometry)
+
+                # 원 포인트들을 PCD로 추가/업데이트
+                pcd_pts_np = np.vstack(pcd_pts_list) if pcd_pts_list else np.zeros((0, 3), dtype=np.float64)
+                if pcd_pts_np.shape[0] > 0:
+                    if c_circles_pcd_geometry is None:
+                        c_circles_pcd_geometry = o3d.geometry.PointCloud()
+                        c_circles_pcd_geometry.points = o3d.utility.Vector3dVector(pcd_pts_np)
+                        c_circles_pcd_geometry.colors = o3d.utility.Vector3dVector(
+                            np.tile(np.array([[0.0, 0.0, 0.0]], dtype=np.float64), (pcd_pts_np.shape[0], 1))
+                        )  # black
+                        vis_instance.add_geometry(c_circles_pcd_geometry)
+                    else:
+                        c_circles_pcd_geometry.points = o3d.utility.Vector3dVector(pcd_pts_np)
+                        c_circles_pcd_geometry.colors = o3d.utility.Vector3dVector(
+                            np.tile(np.array([[0.0, 0.0, 0.0]], dtype=np.float64), (pcd_pts_np.shape[0], 1))
+                        )
+                        vis_instance.update_geometry(c_circles_pcd_geometry)
+                else:
+                    if c_circles_pcd_geometry is not None:
+                        vis_instance.remove_geometry(c_circles_pcd_geometry, reset_bounding_box=False)
+                        c_circles_pcd_geometry = None
+
+                # ALSO draw previous method (RED): ground plane circles -> 요청: 주석처리(비활성)
+                if DRAW_PREV_CIRCLES:
+                    all_pts_prev, all_lines_prev, all_colors_prev = [], [], []
+                    base_idx_prev = 0
+                    for r in radii_along_c:
+                        ring_prev = center + r * (cos_t * u_b_xy + sin_t * u_tan)  # ground plane
+                        all_pts_prev.append(ring_prev)
+                        idxs_prev = np.arange(CIRCLE_SEGS, dtype=np.int32)
+                        lines_prev = np.column_stack([base_idx_prev + idxs_prev, base_idx_prev + (idxs_prev + 1) % CIRCLE_SEGS]).astype(np.int32)
+                        all_lines_prev.append(lines_prev)
+                        all_colors_prev.append(np.tile([1.0, 0.0, 0.0], (lines_prev.shape[0], 1)))  # red
+                        base_idx_prev += CIRCLE_SEGS
+
+                    all_pts_prev_np = np.vstack(all_pts_prev) if all_pts_prev else np.zeros((0, 3), dtype=np.float64)
+                    all_lines_prev_np = np.vstack(all_lines_prev) if all_lines_prev else np.zeros((0, 2), dtype=np.int32)
+                    all_colors_prev_np = np.vstack(all_colors_prev) if all_colors_prev else np.zeros((0, 3), dtype=np.float64)
+                    if c_circles_prev_geometry is None:
+                        c_circles_prev_geometry = o3d.geometry.LineSet()
+                        c_circles_prev_geometry.points = o3d.utility.Vector3dVector(all_pts_prev_np)
+                        c_circles_prev_geometry.lines = o3d.utility.Vector2iVector(all_lines_prev_np)
+                        c_circles_prev_geometry.colors = o3d.utility.Vector3dVector(all_colors_prev_np)
+                        vis_instance.add_geometry(c_circles_prev_geometry)
+                    else:
+                        c_circles_prev_geometry.points = o3d.utility.Vector3dVector(all_pts_prev_np)
+                        c_circles_prev_geometry.lines = o3d.utility.Vector2iVector(all_lines_prev_np)
+                        c_circles_prev_geometry.colors = o3d.utility.Vector3dVector(all_colors_prev_np)
+                        vis_instance.update_geometry(c_circles_prev_geometry)
+                else:
+                    if c_circles_prev_geometry is not None:
+                        vis_instance.remove_geometry(c_circles_prev_geometry, reset_bounding_box=False)
+                        c_circles_prev_geometry = None
+
+            else:
+                if c_circles_geometry is not None:
+                    vis_instance.remove_geometry(c_circles_geometry, reset_bounding_box=False)
+                    c_circles_geometry = None
+                if c_circles_prev_geometry is not None:
+                    vis_instance.remove_geometry(c_circles_prev_geometry, reset_bounding_box=False)
+                    c_circles_prev_geometry = None
+                if c_circles_pcd_geometry is not None:
+                    vis_instance.remove_geometry(c_circles_pcd_geometry, reset_bounding_box=False)
+                    c_circles_pcd_geometry = None
+
+            print("================ Diagram (angles & height) ================")
+            print(f"a (origin→purple, red)       : {a_len:.3f} m")
+            print(f"b (base, magenta)            : {b_len:.3f} m")
+            print(f"f+g (blue total)             : {fg_total:.3f} m  (= |BLUE_DEPTH_Z| + |z_purple-BLUE_DEPTH_Z|)")
+            print(f"g (yellow)                    : {g_upper:.3f} m  (= |z_purple-BLUE_DEPTH_Z|)")
+            print(f"f (blue)                      : {f_lower:.3f} m  (= |BLUE_DEPTH_Z|)")
+            print(f"d (red/base)                 : {d_angle:.2f} deg   (= angle(a,b)=acos(b/|a|)=atan2(f+g, b))")
+            print(f"e (green/base)               : {e_angle:.2f} deg   (= angle(c,b)=acos(b/|c|)=atan2(g, b))")
+            print(f"x (red−green)                : {x_angle:.2f} deg   (= d - e)")
+            print(f"[fit] points used            : {len(closest_line_points)}")
+            print("----------------------------------------------------------")
+            # ==================================================================
         else:
             # If no selection, remove lines if they exist
             if x_axis_line_geometry is not None:
@@ -439,6 +718,26 @@ def update_visualization(vis_instance):
             if blue_to_purple_line_geometry is not None:
                 vis_instance.remove_geometry(blue_to_purple_line_geometry, reset_bounding_box=False)
                 blue_to_purple_line_geometry = None
+            # remove angle arcs
+            if arc_d_geometry is not None:
+                vis_instance.remove_geometry(arc_d_geometry, reset_bounding_box=False)
+                arc_d_geometry = None
+            if arc_e_geometry is not None:
+                vis_instance.remove_geometry(arc_e_geometry, reset_bounding_box=False)
+                arc_e_geometry = None
+            if arc_x_geometry is not None:
+                vis_instance.remove_geometry(arc_x_geometry, reset_bounding_box=False)
+                arc_x_geometry = None
+            # remove c circles
+            if c_circles_geometry is not None:
+                vis_instance.remove_geometry(c_circles_geometry, reset_bounding_box=False)
+                c_circles_geometry = None
+            if c_circles_prev_geometry is not None:
+                vis_instance.remove_geometry(c_circles_prev_geometry, reset_bounding_box=False)
+                c_circles_prev_geometry = None
+            if c_circles_pcd_geometry is not None:
+                vis_instance.remove_geometry(c_circles_pcd_geometry, reset_bounding_box=False)
+                c_circles_pcd_geometry = None
 
         vis_instance.update_renderer()
         vis_instance.poll_events()
@@ -459,6 +758,72 @@ def prev_pcd(vis_instance):
         return
     current_pcd_idx = (current_pcd_idx - 1 + len(pcd_files)) % len(pcd_files)
     update_visualization(vis_instance)
+
+# Build radii along c with near-center bias
+def build_radii_along_c_vals(c_len: float) -> np.ndarray:
+    # Uses NUM_C_RADII rings from near-zero up to c_len (excluding zero),
+    # optional biasing by RADIUS_DISTRIBUTION.
+    if c_len <= 0 or NUM_C_RADII <= 0:
+        return np.zeros((0,), dtype=np.float64)
+    t = np.linspace(0.0, 1.0, NUM_C_RADII + 1, dtype=np.float64)[1:]  # drop zero
+    if RADIUS_DISTRIBUTION == "near":
+        # 중심(blue) 근처에 촘촘
+        if NEAR_BIAS != 1.0:
+            t = t ** NEAR_BIAS
+    elif RADIUS_DISTRIBUTION == "cosine":
+        # 양 끝(0과 |c|)에서 촘촘: t' = (1 - cos(pi t)) / 2
+        t = (1.0 - np.cos(np.pi * t)) * 0.5
+    # else 'uniform': 그대로 사용
+    radii = t * c_len
+    if MIN_FIRST_RADIUS > 0.0:
+        radii = radii[radii >= MIN_FIRST_RADIUS]
+    # 먼쪽(보라색점 방향)에서 N개 제거
+    if SKIP_FAR_COUNT > 0:
+        keep = max(len(radii) - int(SKIP_FAR_COUNT), 0)
+        radii = radii[:keep]
+    return radii
+
+# === Ground grid (z=0) helpers ===
+def build_ground_grid(size_x=20.0, size_y=20.0, step=1.0, z=0.0, color=(0.6, 0.6, 0.6)) -> o3d.geometry.LineSet:
+    xs = np.arange(-size_x, size_x + 1e-9, step, dtype=np.float64)
+    ys = np.arange(-size_y, size_y + 1e-9, step, dtype=np.float64)
+
+    pts = []
+    lines = []
+    colors = []
+
+    # vertical lines (constant x)
+    idx = 0
+    for x in xs:
+        pts.append([x, -size_y, z])
+        pts.append([x,  size_y, z])
+        lines.append([idx, idx + 1]); idx += 2
+        colors.append(list(color))
+    # horizontal lines (constant y)
+    for y in ys:
+        pts.append([-size_x, y, z])
+        pts.append([ size_x, y, z])
+        lines.append([idx, idx + 1]); idx += 2
+        colors.append(list(color))
+
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(np.asarray(pts, dtype=np.float64))
+    ls.lines = o3d.utility.Vector2iVector(np.asarray(lines, dtype=np.int32))
+    ls.colors = o3d.utility.Vector3dVector(np.asarray(colors, dtype=np.float64))
+    return ls
+
+def toggle_ground_plane(vis_instance):
+    global ground_plane_geometry, GROUND_SIZE_X, GROUND_SIZE_Y, GROUND_STEP
+    try:
+        if ground_plane_geometry is None:
+            ground_plane_geometry = build_ground_grid(GROUND_SIZE_X, GROUND_SIZE_Y, GROUND_STEP, z=BLUE_DEPTH_Z, color=(0.6, 0.6, 0.6))
+            vis_instance.add_geometry(ground_plane_geometry)
+        else:
+            vis_instance.remove_geometry(ground_plane_geometry, reset_bounding_box=False)
+            ground_plane_geometry = None
+        vis_instance.update_renderer()
+    except Exception as e:
+        print(f"toggle_ground_plane error: {e}")
 
 def run_batch_processing(input_path, output_base_path):
     """
@@ -540,6 +905,7 @@ def run_interactive_viewer(input_path):
 
     print(f"Found {len(pcd_files)} PCD files.")
     print("Use 'n' for next, 'p' for previous. Press 'Q' or 'Esc' to quit.")
+    print("Press 'G' to toggle ground grid (z=BLUE_DEPTH_Z).")
 
     vis = o3d.visualization.VisualizerWithKeyCallback()
     vis.create_window(window_name="Closest Line by 3D Euclidean Distance (Interactive)", width=1024, height=768)
@@ -551,6 +917,7 @@ def run_interactive_viewer(input_path):
     # Register key callbacks
     vis.register_key_callback(ord('N'), next_pcd)
     vis.register_key_callback(ord('P'), prev_pcd)
+    vis.register_key_callback(ord('G'), toggle_ground_plane)  # toggle ground grid
     
     # Initial visualization
     update_visualization(vis)

@@ -12,6 +12,13 @@ import numpy as np
 import cv2
 
 try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+    print("Warning: PIL not available. Falling back to OpenCV only for PNG saving.", file=sys.stderr)
+
+try:
     import open3d as o3d
     OPEN3D_AVAILABLE = True
 except ImportError:
@@ -125,24 +132,39 @@ def load_pcd_xyz(path: Path) -> np.ndarray:
     if OPEN3D_AVAILABLE:
         try:
             pcd = o3d.io.read_point_cloud(str(path))
-            return np.asarray(pcd.points, dtype=np.float64) if pcd.has_points() else np.empty((0, 3))
+            points = np.asarray(pcd.points, dtype=np.float64) if pcd.has_points() else np.empty((0, 3))
         except Exception as e:
             print(f"Warning: open3d failed to read {path}. Falling back. Error: {e}", file=sys.stderr)
+            points = np.empty((0, 3))
+    else:
+        points = []
+        with open(path, 'r', encoding='utf-8') as f:
+            data_started = False
+            for line in f:
+                if data_started:
+                    try:
+                        parts = line.strip().split()
+                        if len(parts) >= 3:
+                            points.append([float(parts[0]), float(parts[1]), float(parts[2])])
+                    except (ValueError, IndexError):
+                        continue
+                elif line.startswith("DATA ascii"):
+                    data_started = True
+        points = np.array(points, dtype=np.float64)
 
-    points = []
-    with open(path, 'r', encoding='utf-8') as f:
-        data_started = False
-        for line in f:
-            if data_started:
-                try:
-                    parts = line.strip().split()
-                    if len(parts) >= 3:
-                        points.append([float(parts[0]), float(parts[1]), float(parts[2])])
-                except (ValueError, IndexError):
-                    continue
-            elif line.startswith("DATA ascii"):
-                data_started = True
-    return np.array(points, dtype=np.float64)
+    # [ADD] PCD 로드 시 strip_mask 적용 (integrated_pcd_depth_pipeline_newest.py와 동일)
+    if points.size > 0:
+        strip_mask = (
+            # (points[:,1] >= -0.7) &
+            # (points[:,1] <= 0.5) &
+            (points[:,0] >= 0.0)  # X >= 0 포인트 제거
+        )
+        if np.any(strip_mask):
+            removed = int(strip_mask.sum())
+            points = points[~strip_mask]
+            print(f"[STRIP] Removed {removed} front-strip points at load (remain {points.shape[0]})")
+
+    return points
 
 def load_image(path: Path) -> np.ndarray:
     """Loads an image using OpenCV."""
@@ -168,10 +190,22 @@ class LidarCameraProjector:
         depth_map = np.zeros((image_height, image_width), dtype=np.float32)
         
         cloud_xyz_hom = np.hstack((cloud_xyz, np.ones((cloud_xyz.shape[0], 1))))
+        
+
+        # [FIX] 포인트 필터링 추가 - create_depth_maps.py와 동일
+        # Define the exclusion condition based on Y and X coordinates
+        # Exclude points where (Y <= 0.5 and Y >= -0.7) AND (X >= 0.0)
         exclude_y_condition = (cloud_xyz_hom[:, 1] <= 0.5) & (cloud_xyz_hom[:, 1] >= -0.7)
         exclude_x_condition = (cloud_xyz_hom[:, 0] >= 0.0)
+        
+        # Combine conditions to get points to EXCLUDE
         points_to_exclude = exclude_y_condition & exclude_x_condition
+        
+        # Keep only the points that are NOT in the exclusion set
         cloud_xyz_hom = cloud_xyz_hom[~points_to_exclude]
+        # 필터링 제거: 카메라 변환 후 Xc <= 0 제외로 충분
+        # (원래 y 조건도 제거되었으므로, 모든 포인트를 변환에 맡김)
+        
         lidar_to_camera_transform = cam_extrinsic @ self.calib_db.lidar_to_world
         points_cam_hom = (lidar_to_camera_transform @ cloud_xyz_hom.T).T
         points_cam = points_cam_hom[:, :3]
@@ -193,7 +227,23 @@ class LidarCameraProjector:
 def save_depth_map(path: Path, depth_map: np.ndarray):
     """Saves a depth map as a 16-bit PNG image, following KITTI conventions."""
     depth_map_uint16 = (depth_map * 256.0).astype(np.uint16)
-    cv2.imwrite(str(path), depth_map_uint16, [cv2.IMWRITE_PNG_BIT_DEPTH, 16])
+    
+    # OpenCV로 16비트 PNG 저장 시도
+    try:
+        cv2.imwrite(str(path), depth_map_uint16, [cv2.IMWRITE_PNG_BIT_DEPTH, 16])
+    except (AttributeError, cv2.error):
+        # IMWRITE_PNG_BIT_DEPTH 없거나 오류 시 PIL fallback
+        if PIL_AVAILABLE:
+            try:
+                img = Image.fromarray(depth_map_uint16, mode='I')
+                img.save(str(path), format='PNG')
+                print(f"Info: Saved {path.name} using PIL (16-bit PNG).")
+            except Exception as e:
+                print(f"Error: PIL saving failed for {path.name}: {e}. Using OpenCV default.", file=sys.stderr)
+                cv2.imwrite(str(path), depth_map_uint16)
+        else:
+            print(f"Warning: PIL not available. Using OpenCV default for {path.name}.", file=sys.stderr)
+            cv2.imwrite(str(path), depth_map_uint16)
 
 def process_folder(projector: LidarCameraProjector, parent_folder: Path, cam_name: str, output_dir: Path):
     synced_data_dir = parent_folder / "synced_data"
@@ -207,6 +257,8 @@ def process_folder(projector: LidarCameraProjector, parent_folder: Path, cam_nam
         mapping_data = json.load(f)
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    debug_printed = False  # 디버그 프린트 1번만 수행하기 위한 플래그
 
     if isinstance(mapping_data, dict) and "image_a6" in mapping_data and "pcd" in mapping_data:
         image_rel_paths = mapping_data["image_a6"]
@@ -225,13 +277,17 @@ def process_folder(projector: LidarCameraProjector, parent_folder: Path, cam_nam
             if not image_path.exists():
                 image_path = image_path.with_suffix('.jpg')
                 if not image_path.exists():
-                    print(f"DEBUG: Image file not found: {image_path.with_suffix('.png')} or {image_path}", file=sys.stderr)
+                    if not debug_printed:
+                        print(f"DEBUG: Image file not found: {image_path.with_suffix('.png')} or {image_path}", file=sys.stderr)
+                        debug_printed = True
                     continue
             
             if not pcd_path.exists():
                 pcd_path = pcd_path.with_suffix('.bin')
                 if not pcd_path.exists():
-                    print(f"DEBUG: PCD file not found: {pcd_path.with_suffix('.pcd')} or {pcd_path}", file=sys.stderr)
+                    if not debug_printed:
+                        print(f"DEBUG: PCD file not found: {pcd_path.with_suffix('.pcd')} or {pcd_path}", file=sys.stderr)
+                        debug_printed = True
                     continue
 
             try:
@@ -248,7 +304,8 @@ def process_folder(projector: LidarCameraProjector, parent_folder: Path, cam_nam
                 traceback.print_exc()
     elif isinstance(mapping_data, list):
         print(f"Warning: mapping_data.json is a list of objects. Processing with 'new_filename' assumption.", file=sys.stderr)
-        print(f"Processing {len(mapping_data)} files. Saving depth maps to {output_dir}")
+        num_samples = len(mapping_data)  # num_samples 정의 추가
+        print(f"Processing {num_samples} files. Saving depth maps to {output_dir}")
 
         for item in tqdm(mapping_data):
             new_filename = item.get("new_filename")
@@ -261,13 +318,17 @@ def process_folder(projector: LidarCameraProjector, parent_folder: Path, cam_nam
             if not image_path.exists():
                 image_path = image_path.with_suffix('.jpg')
                 if not image_path.exists():
-                    print(f"DEBUG: Image file not found: {image_path.with_suffix('.png')} or {image_path}", file=sys.stderr)
+                    if not debug_printed:
+                        print(f"DEBUG: Image file not found: {image_path.with_suffix('.png')} or {image_path}", file=sys.stderr)
+                        debug_printed = True
                     continue
             
             if not pcd_path.exists():
                 pcd_path = pcd_path.with_suffix('.bin')
                 if not pcd_path.exists():
-                    print(f"DEBUG: PCD file not found: {pcd_path.with_suffix('.pcd')} or {pcd_path}", file=sys.stderr)
+                    if not debug_printed:
+                        print(f"DEBUG: PCD file not found: {pcd_path.with_suffix('.pcd')} or {pcd_path}", file=sys.stderr)
+                        debug_printed = True
                     continue
 
             try:
