@@ -31,6 +31,115 @@ RADIUS_DISTRIBUTION = "uniform"  # 'uniform' | 'near' | 'cosine'
 XY_MIN_SEPARATION = 0.1
 
 # =============================================================================
+# PCD Parser Helper (supports both ASCII and BINARY formats)
+# =============================================================================
+def parse_pcd_fallback(pcd_path: Path) -> Optional[np.ndarray]:
+    """
+    Parse PCD file in both ASCII and BINARY formats.
+    Returns array of shape (N, 3) with x, y, z coordinates, or None on error.
+    """
+    try:
+        with open(pcd_path, 'rb') as f:
+            # Read header to determine format
+            header_lines = []
+            data_format = None
+            field_names = []
+            field_sizes = []
+            field_types = []
+            num_points = 0
+            
+            while True:
+                line = f.readline()
+                if not line:
+                    break
+                
+                line_str = line.decode('utf-8', errors='ignore').strip()
+                header_lines.append(line_str)
+                
+                if line_str.startswith('FIELDS'):
+                    field_names = line_str.split()[1:]
+                elif line_str.startswith('SIZE'):
+                    field_sizes = list(map(int, line_str.split()[1:]))
+                elif line_str.startswith('TYPE'):
+                    field_types = line_str.split()[1:]
+                elif line_str.startswith('POINTS'):
+                    num_points = int(line_str.split()[1])
+                elif line_str.startswith('DATA'):
+                    data_format = line_str.split()[1]
+                    break
+            
+            if data_format is None or num_points == 0:
+                return None
+            
+            # Extract x, y, z indices
+            try:
+                x_idx = field_names.index('x')
+                y_idx = field_names.index('y')
+                z_idx = field_names.index('z')
+            except ValueError:
+                print(f"Warning: PCD file missing x/y/z fields: {pcd_path}")
+                return None
+            
+            points = []
+            
+            if data_format == 'ascii':
+                # Parse ASCII data
+                for line in f:
+                    line_str = line.decode('utf-8', errors='ignore').strip()
+                    if not line_str:
+                        continue
+                    try:
+                        parts = line_str.split()
+                        if len(parts) > max(x_idx, y_idx, z_idx):
+                            x = float(parts[x_idx])
+                            y = float(parts[y_idx])
+                            z = float(parts[z_idx])
+                            points.append([x, y, z])
+                    except (ValueError, IndexError):
+                        continue
+            
+            elif data_format == 'binary':
+                # Parse BINARY data
+                import struct
+                
+                # Calculate byte offset for each field
+                offsets = [0]
+                for i in range(len(field_names) - 1):
+                    offsets.append(offsets[-1] + field_sizes[i])
+                
+                record_size = sum(field_sizes)
+                
+                for _ in range(num_points):
+                    record = f.read(record_size)
+                    if len(record) < record_size:
+                        break
+                    
+                    try:
+                        # Extract x, y, z based on their type and offset
+                        x = struct.unpack('f', record[offsets[x_idx]:offsets[x_idx]+4])[0]
+                        y = struct.unpack('f', record[offsets[y_idx]:offsets[y_idx]+4])[0]
+                        z = struct.unpack('f', record[offsets[z_idx]:offsets[z_idx]+4])[0]
+                        points.append([x, y, z])
+                    except (struct.error, IndexError):
+                        continue
+            
+            else:
+                try:
+                    print(f"Warning: Unknown DATA format '{data_format}' in {pcd_path}", flush=True)
+                except:
+                    print(f"Warning: Unknown DATA format in PCD file", flush=True)
+                return None
+            
+            return np.array(points, dtype=np.float32) if points else None
+    
+    except Exception as e:
+        try:
+            print(f"Error parsing PCD file {pcd_path}: {e}", flush=True)
+        except:
+            print(f"Error parsing PCD file: {type(e).__name__}", flush=True)
+        return None
+
+# =============================================================================
 # Road Geometry Analysis (from find_road_by_geometry.py)
 # =============================================================================
 def find_nearest_road_point_and_generate_synthetic_pcd(
@@ -71,21 +180,10 @@ def find_nearest_road_point_and_generate_synthetic_pcd(
                 return np.empty((0, 3)), None
             all_points_np = np.asarray(pcd.points)
         else:
-            # Fallback ASCII parser (simple)
-            points = []
-            with open(pcd_path, 'r', encoding='utf-8') as f:
-                data_started = False
-                for line in f:
-                    if data_started:
-                        try:
-                            parts = line.strip().split()
-                            if len(parts) >= 3:
-                                points.append([float(parts[0]), float(parts[1]), float(parts[2])])
-                        except (ValueError, IndexError):
-                            continue
-                    elif line.startswith("DATA ascii"):
-                        data_started = True
-            all_points_np = np.array(points, dtype=np.float32) if points else np.empty((0, 3), dtype=np.float32)
+            # Fallback parser for ASCII and BINARY formats
+            all_points_np = parse_pcd_fallback(pcd_path)
+            if all_points_np is None or all_points_np.size == 0:
+                all_points_np = np.empty((0, 3), dtype=np.float32)
 
         if all_points_np.size == 0:
             print(f"Warning: Empty point cloud in {pcd_path}")
@@ -205,7 +303,10 @@ def find_nearest_road_point_and_generate_synthetic_pcd(
         return closest_line_points, all_points_np
 
     except Exception as e:
-        print(f"Error processing {pcd_path}: {e}")
+        try:
+            print(f"Error processing {pcd_path}: {e}", flush=True)
+        except:
+            print(f"Error processing PCD file (encoding error): {type(e).__name__}", flush=True)
         return np.empty((0, 3)), None
 
 def build_radii_along_c_vals(c_len: float) -> np.ndarray:
@@ -376,14 +477,44 @@ class VADASFisheyeCameraModel(CameraModelBase):
         self.ux = intrinsic[9]
         self.uy = intrinsic[10]
         self.image_size = image_size
+        self.original_intrinsic = intrinsic.copy()  # [ADD] Store original intrinsic
+        self.scale_x = 1.0  # [ADD] Aspect ratio scale factors
+        self.scale_y = 1.0
 
     def _poly_eval(self, coeffs: List[float], x: float) -> float:
         res = 0.0
         for c in reversed(coeffs):
             res = res * x + c
         return res
+    
+    def scale_intrinsics(self, scale_x: float, scale_y: float) -> None:
+        """[ADD] Scale intrinsic parameters for different image sizes
+        
+        Based on verified test_640x384_div_comparison.py with aspect ratio support:
+        - ux, uy scale by multiplying with scale factors
+        - div remains UNCHANGED (original value)
+        - scale_x, scale_y are stored and applied in project_point()
+        - k, s coefficients do NOT scale (normalized coordinates)
+        """
+        # Principal point offset scales with image size
+        self.ux = self.original_intrinsic[9] * scale_x
+        self.uy = self.original_intrinsic[10] * scale_y
+        
+        # [CRITICAL] div stays at original value!
+        # Aspect ratio scaling is applied directly in project_point()
+        self.div = self.original_intrinsic[8]
+        
+        # Store scale factors for use in project_point()
+        self.scale_x = scale_x
+        self.scale_y = scale_y
 
     def project_point(self, Xc: float, Yc: float, Zc: float) -> Tuple[int, int, bool]:
+        """
+        Project 3D camera coordinates to 2D image coordinates.
+        
+        Based on ref_camera_lidar_projector.py with aspect ratio scaling support.
+        Aspect ratio is applied via self.scale_x and self.scale_y to the final coordinates.
+        """
         nx = -Yc
         ny = -Zc
         dist = math.hypot(nx, ny)
@@ -407,8 +538,9 @@ class VADASFisheyeCameraModel(CameraModelBase):
         img_w_half = (self.image_size[0] / 2) if self.image_size else 0
         img_h_half = (self.image_size[1] / 2) if self.image_size else 0
 
-        u = rd * cosPhi + self.ux + img_w_half
-        v = rd * sinPhi + self.uy + img_h_half
+        # [ADD] Apply aspect ratio scaling to rd components
+        u = rd * cosPhi * self.scale_x + self.ux + img_w_half
+        v = rd * sinPhi * self.scale_y + self.uy + img_h_half
         
         return int(round(u)), int(round(v)), True
 
@@ -468,8 +600,20 @@ class LidarCameraProjector:
         cam_extrinsic = sensor_info.extrinsic
         image_width, image_height = image_size
 
-        if isinstance(camera_model, VADASFisheyeCameraModel) and camera_model.image_size is None:
-            camera_model.image_size = (image_width, image_height)
+        # [ADD] Handle resized projections
+        # [FIX] Use temporary scaled model instead of modifying original
+        if isinstance(camera_model, VADASFisheyeCameraModel):
+            original_size = (1920, 1536)  # Default original size
+            if hasattr(sensor_info, 'image_size') and sensor_info.image_size:
+                original_size = sensor_info.image_size
+            
+            if (image_width, image_height) != original_size:
+                scale_x = image_width / original_size[0]
+                scale_y = image_height / original_size[1]
+                # Create a temporary scaled model to avoid modifying the original
+                temp_camera_model = VADASFisheyeCameraModel(camera_model.original_intrinsic, image_size=(image_width, image_height))
+                temp_camera_model.scale_intrinsics(scale_x, scale_y)
+                camera_model = temp_camera_model
 
         depth_map = np.zeros((image_height, image_width), dtype=np.float32)
         
@@ -519,8 +663,24 @@ class LidarCameraProjector:
         cam_extrinsic = sensor_info.extrinsic
         w, h = image_size
 
-        if isinstance(camera_model, VADASFisheyeCameraModel) and camera_model.image_size is None:
-            camera_model.image_size = (w, h)
+        # [ADD] Handle resized projections
+        if isinstance(camera_model, VADASFisheyeCameraModel):
+            if camera_model.image_size is None:
+                camera_model.image_size = (w, h)
+            
+            # Check if we need to scale intrinsics
+            original_size = (1920, 1536)  # Default original size
+            if hasattr(sensor_info, 'image_size') and sensor_info.image_size:
+                original_size = sensor_info.image_size
+            
+            if (w, h) != original_size:
+                scale_x = w / original_size[0]
+                scale_y = h / original_size[1]
+                
+                # Create a temporary scaled model for this projection
+                temp_model = VADASFisheyeCameraModel(camera_model.original_intrinsic, image_size=(w, h))
+                temp_model.scale_intrinsics(scale_x, scale_y)
+                camera_model = temp_model
 
         depth = np.zeros((h, w), dtype=np.float32)
         provenance = np.full((h, w), -1, dtype=np.int8)  # -1: empty, 0 orig, 1 synth
@@ -578,6 +738,31 @@ def save_synthetic_pcd(points: np.ndarray, output_path: Path) -> None:
     except Exception as e:
         print(f"Error saving PCD to {output_path}: {e}")
         raise
+
+def create_rgb_with_depth_scatter(rgb_image: np.ndarray, depth_map: np.ndarray,
+                                  point_size: int = 2, max_depth: float = 15.0) -> np.ndarray:
+    """Draw depth points on RGB image using OpenCV scatter-style visualization."""
+    overlay = rgb_image.copy()
+    h, w = depth_map.shape
+    
+    valid_mask = depth_map > 0
+    valid_coords = np.argwhere(valid_mask)
+    
+    if len(valid_coords) == 0:
+        return overlay
+    
+    depths = depth_map[valid_mask]
+    depths_normalized = np.clip(depths / max_depth, 0, 1)
+    depths_uint8 = (depths_normalized * 255).astype(np.uint8)
+    
+    depth_colors_1d = cv2.applyColorMap(depths_uint8.reshape(-1, 1, 1), cv2.COLORMAP_JET)
+    depth_colors = depth_colors_1d.reshape(-1, 3)
+    
+    for (y, x), color in zip(valid_coords, depth_colors):
+        color_tuple = (int(color[0]), int(color[1]), int(color[2]))
+        cv2.circle(overlay, (int(x), int(y)), point_size, color_tuple, -1)
+    
+    return overlay
 
 def save_depth_map(path: Path, depth_map: np.ndarray) -> None:
     """Saves a depth map as a 16-bit PNG image, following KITTI conventions."""
@@ -720,6 +905,195 @@ def create_depth_colormap_image(depth_map: np.ndarray, output_path: Path) -> Non
     except Exception as e:
         print(f"Error creating colorized depth map for {output_path}: {e}")
 
+def save_diff_depth_map_white_bg(path: Path, depth_map: np.ndarray) -> None:
+    """
+    diff_results 전용:
+      - 기존 save_depth_map이 depth*256 하는 것과 달리 원본(depth) 값 그대로 사용 (== 이전 대비 256으로 나눈 효과)
+      - 0인 픽셀(미할당)을 흰색(65535)으로 설정
+      - 16비트 PNG로 저장
+    """
+    try:
+        dm = depth_map.copy()
+        # 원본 값 그대로 (배율 없음) -> uint16 캐스팅
+        dm_uint16 = dm.astype(np.uint16)
+        # 0 -> 흰색
+        zero_mask = dm_uint16 == 0
+        dm_uint16[zero_mask] = 65535
+        cv2.imwrite(str(path), dm_uint16)
+    except Exception as e:
+        print(f"[WARN] save_diff_depth_map_white_bg failed ({path.name}): {e}")
+
+# 컬러 전용 저장 함수 추가
+def save_diff_depth_colormap(
+    path: Path,
+    depth_map: np.ndarray,
+    percentile: float = 95.0,
+    point_thickness: int = 2,
+    dilation_iterations: int = 1,
+    warm_max: float = 1.25,
+    bin_size: float = 1.0,
+) -> None:
+    """diff 결과용 컬러맵 저장 (로그 스케일 + reversed JET + 전역 고정 min/max)
+
+    변경 사항:
+      - 첫 호출 시 depth>0 픽셀의 (global_min, global_max)를 고정 (이후 프레임 동일 스케일 유지)
+      - (global_min, global_max) 범위 밖 값은 클리핑 (일관된 색 유지)
+      - log1p 대신 log(depth)를 사용 (더 자연스러운 상대적 차이 강조) / depth==0은 배경
+      - JET 컬러맵을 역순으로 적용 (reversed JET)
+      - point_thickness 옵션은 기존 방식 유지 (마스크 팽창)
+    NOTE: percentile 파라미터는 더 이상 사용하지 않지만 호출 호환성을 위해 남김.
+    """
+    try:
+        # 전역 상태 (최초 1회 결정 후 고정)
+        global _DIFF_GLOBAL_MIN, _DIFF_GLOBAL_MAX, _REV_JET_LUT
+        valid = depth_map[depth_map > 0]
+        if valid.size == 0:
+            print(f"[DIFF_COLOR] No valid depths for {path.name}")
+            return
+
+        if '_DIFF_GLOBAL_MIN' not in globals():  # type: ignore
+            _DIFF_GLOBAL_MIN = None  # for mypy silence if any
+        if '_DIFF_GLOBAL_MAX' not in globals():  # type: ignore
+            _DIFF_GLOBAL_MAX = None
+
+        # 최초 호출 시 전역 min/max 결정 (양수 값 기반)
+        if _DIFF_GLOBAL_MIN is None or _DIFF_GLOBAL_MAX is None:
+            local_min = float(valid.min())
+            if local_min <= 0:
+                pos_vals = valid[valid > 0]
+                if pos_vals.size == 0:
+                    print(f"[DIFF_COLOR] No positive depths for {path.name}")
+                    return
+                local_min = float(pos_vals.min())
+            local_max = float(valid.max())
+            if local_max <= local_min:
+                local_max = local_min * 1.0001
+            _DIFF_GLOBAL_MIN = local_min
+            _DIFF_GLOBAL_MAX = local_max
+            print(f"[DIFF_COLOR_LOG] Global depth range fixed: min={_DIFF_GLOBAL_MIN:.6f}, max={_DIFF_GLOBAL_MAX:.6f}")
+
+        gmin = _DIFF_GLOBAL_MIN
+        gmax = _DIFF_GLOBAL_MAX
+        if gmin <= 0:
+            gmin = 1e-6
+        if gmax <= gmin:
+            gmax = gmin * 1.0001
+
+        global _CUSTOM_ADAPTIVE_LUT, _CUSTOM_VALUE_STOPS
+        if '_CUSTOM_ADAPTIVE_LUT' not in globals():
+            _CUSTOM_ADAPTIVE_LUT = None  # type: ignore
+        if '_CUSTOM_VALUE_STOPS' not in globals():
+            _CUSTOM_VALUE_STOPS = None  # type: ignore
+
+    # ---------------- Meter-based mapping (parameterized) ----------------
+    # 0~warm_max: Smooth gradient (Red -> Orange -> Yellow)
+    # >warm_max: bin_size step discrete blue-ish bands
+        if _CUSTOM_ADAPTIVE_LUT is None:
+            # Build warm gradient for 0-5m (256 entries dedicated portion)
+            warm_res = 1024
+            warm = np.zeros((warm_res, 3), dtype=np.float32)
+            # Define color anchors for warm gradient (BGR)
+            # t=0: Red, t=0.5: Orange, t=1.0: Yellow
+            for i in range(warm_res):
+                t = i / (warm_res - 1)
+                if t < 0.5:
+                    # Red -> Orange
+                    alpha = t / 0.5
+                    c0 = np.array([0, 0, 255], dtype=np.float32)
+                    c1 = np.array([0, 96, 255], dtype=np.float32)
+                    warm[i] = (1 - alpha) * c0 + alpha * c1
+                else:
+                    # Orange -> Yellow
+                    alpha = (t - 0.5) / 0.5
+                    c0 = np.array([0, 96, 255], dtype=np.float32)
+                    c1 = np.array([0, 255, 255], dtype=np.float32)
+                    warm[i] = (1 - alpha) * c0 + alpha * c1
+
+            # Blue bands for >5m; define discrete palette for successive 2.5m bins
+            blue_bins_colors = [
+                (160, 255, 255),  # 5 - 7.5m (Cyan)
+                (200, 200, 255),  # 7.5 - 10m (Pale Blue)
+                (220, 170, 255),  # 10 - 12.5m (Soft Blue)
+                (235, 140, 250),  # 12.5 - 15m (Lavender)
+                (245, 110, 240),  # 15 - 17.5m (Light Purple)
+                (255, 80, 210),   # 17.5 - 20m (Magenta-Purple)
+                (255, 40, 160),   # 20 - 22.5m (Deep Purple)
+                (255, 10, 110),   # 22.5 - 25m (Magenta-Blue)
+                (255, 0, 70),     # 25 - 27.5m (Deep Magenta)
+                (255, 0, 40),     # 27.5 - 30m (Crimson-Blue edge)
+                (255, 0, 20),     # 30 - 32.5m (Near Blue)
+                (255, 0, 0),      # 32.5m+ (Blue solid)
+            ]
+            _CUSTOM_ADAPTIVE_LUT = {
+                'warm': warm.astype(np.uint8),
+                'blue_bins': blue_bins_colors
+            }
+            print("[DIFF_METER] Meter-based palette initialized (warm gradient + discrete bins)")
+
+        # Depth normalization is purely in meters now
+        warm = _CUSTOM_ADAPTIVE_LUT['warm']  # type: ignore
+        blue_bins = _CUSTOM_ADAPTIVE_LUT['blue_bins']  # type: ignore
+
+        h, w = depth_map.shape
+        # 내부 계산 시 배경을 0(검정)으로 두고 마지막에 흰색으로 교체해야 흰색이 dilation 색상 전파를 막지 않음
+        color = np.zeros((h, w, 3), dtype=np.uint8)
+        dm = depth_map
+
+        # 0 ~ warm_max warm gradient
+        warm_mask = (dm > 0) & (dm <= warm_max)
+        if np.any(warm_mask):
+            t = np.clip(dm[warm_mask] / max(warm_max, 1e-6), 0, 1)
+            idx = (t * (warm.shape[0] - 1)).astype(np.int32)
+            color[warm_mask] = warm[idx]
+
+        # > warm_max discrete bins (bin_size)
+        for bi, col in enumerate(blue_bins):
+            start = warm_max + bi * bin_size
+            end = start + bin_size
+            if bi == len(blue_bins) - 1:
+                bin_mask = dm > start
+            else:
+                bin_mask = (dm > start) & (dm <= end)
+            if np.any(bin_mask):
+                color[bin_mask] = col
+
+        # 단일 팽창 처리: point_thickness 를 반경(radius)으로 간주하여 kernel=2r+1 적용
+        if point_thickness > 0:
+            k = 2 * point_thickness + 1  # radius -> kernel size (odd)
+            base_mask = (dm > 0).astype(np.uint8)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            dilated = cv2.dilate(base_mask, kernel, iterations=max(1, dilation_iterations))
+            expand = (dilated > 0) & (base_mask == 0)
+            # 색상 전파: 흰색 배경 간섭 방지를 위해 현재(검정) 상태에서만 채워짐
+            for c in range(3):
+                ch = color[:, :, c]
+                ch_dil = cv2.dilate(ch, kernel, iterations=max(1, dilation_iterations))
+                ch[expand] = ch_dil[expand]
+            mask_valid = dilated
+        else:
+            k = 1  # for debug logging
+            mask_valid = (dm > 0).astype(np.uint8)
+
+        # 배경을 명시적으로 흰색 처리 (팽창 후 외곽 포함)
+        color[mask_valid == 0] = [255, 255, 255]
+
+        # Debug (최초 1회 + 이후 간단 로그)
+        if '_DIFF_METER_DEBUG' not in globals():
+            over_mask_count = (dm > warm_max).sum()
+            gap_count = ((dm > warm_max) & (dm < warm_max + bin_size)).sum()
+            print(f"[DIFF_METER_DEBUG] Warm={warm_mask.sum()} OverWarm={over_mask_count} FirstBinCandidates={gap_count} warm_max={warm_max} bin_size={bin_size} kernel={k} radius={point_thickness} iter={dilation_iterations}")
+            _DIFF_METER_DEBUG = True  # type: ignore
+        else:
+            print(f"[DIFF_POINT_SIZE] kernel={k} radius={point_thickness} iter={dilation_iterations} warm_max={warm_max} bin={bin_size} -> {path.name}")
+
+        try:
+            cv2.imwrite(str(path), color)
+            print(f"[DIFF_COLOR_SAVE] {path.name} (pt_radius={point_thickness}, kernel={k}, iter={dilation_iterations}, warm_max={warm_max}, bin_size={bin_size})")
+        except Exception as ie:
+            print(f"[DIFF_COLOR_SAVE_FAIL] {path.name}: {ie}")
+    except Exception as e:
+        print(f"[WARN] save_diff_depth_colormap failed ({path.name}): {e}")
+
 # =============================================================================
 # Default Configuration
 # =============================================================================
@@ -754,11 +1128,13 @@ def run_integrated_pipeline(
     xy_radius_threshold: float = 10.0,
     y_min: Optional[float] = None,
     y_max: Optional[float] = None,
-    num_radius_divisions: int = 20,    # kept for CLI compatibility
-    points_per_circle: int = 200,      # kept for CLI compatibility
+    num_radius_divisions: int = 20,
+    points_per_circle: int = 200,
     reference_image_size: Tuple[int, int] = (1920, 1536),
-    keep_original_points: bool = True,  # kept for CLI compatibility (no effect)
-    exclude_outermost_circle: bool = True  # kept for CLI compatibility (no effect)
+    keep_original_points: bool = True,
+    exclude_outermost_circle: bool = True,
+    diff_point_size: int = 5,
+    diff_point_iterations: int = 1
 ) -> None:
     print(f"=== Integrated PCD-to-Depth Pipeline (Closest-Line Mode) ===")
     print(f"Parent folder: {parent_folder}")
@@ -790,17 +1166,68 @@ def run_integrated_pipeline(
     newest_depth_maps_dir = base_dir / "newest_depth_maps"
     newest_viz_results_dir = base_dir / "newest_viz_results"
     newest_colormap_dir = base_dir / "newest_colormap"
+    newest_synthetic_depth_maps_dir = base_dir / "newest_synthetic_depth_maps"  # synthetic 전용
+    diff_results_dir = base_dir / "diff_results"  # [ADD]
 
     newest_pcd_dir.mkdir(parents=True, exist_ok=True)
     newest_depth_maps_dir.mkdir(parents=True, exist_ok=True)
     newest_viz_results_dir.mkdir(parents=True, exist_ok=True)
     newest_colormap_dir.mkdir(parents=True, exist_ok=True)
+    newest_synthetic_depth_maps_dir.mkdir(parents=True, exist_ok=True)
+    diff_results_dir.mkdir(parents=True, exist_ok=True)  # [ADD]
 
-    print(f"[DEBUG] Output directories created under: {base_dir}")
+    # [ADD] Resized output directories (640x512 and 640x384)
+    # Define resized resolutions as a list of tuples (width, height)
+    resized_resolutions = [(640, 512), (640, 384)]
+    
+    # Initialize dictionaries to store directory paths for each resolution
+    resized_dirs = {}  # {(w, h): {pcd_dir, depth_maps_dir, ...}}
+    process_resized = {}  # {(w, h): should_process}
+    
+    for res_size in resized_resolutions:
+        res_name = f"{res_size[0]}x{res_size[1]}"
+        resized_base_dir = base_dir / f"{res_name}_newest"
+        
+        # [FIX] Always create resized_dirs dictionary (even if folder exists)
+        # This is needed for the processing loop to access paths
+        resized_dirs[res_size] = {
+            'base': resized_base_dir,
+            'pcd': resized_base_dir / "newest_pcd",
+            'depth_maps': resized_base_dir / "newest_depth_maps",
+            'viz_results': resized_base_dir / "newest_viz_results",
+            'colormap': resized_base_dir / "newest_colormap",
+            'synthetic_depth_maps': resized_base_dir / "newest_synthetic_depth_maps",
+            'diff_results': resized_base_dir / "diff_results",
+        }
+        
+        # [FIX] Check if all required files exist, not just folder
+        # Only skip if viz_results folder exists AND has files
+        viz_results_dir = resized_dirs[res_size]['viz_results']
+        process_resized[res_size] = not (viz_results_dir.exists() and any(viz_results_dir.iterdir()))
+        
+        if process_resized[res_size]:
+            # Create all directories only if they don't exist
+            for dir_path in resized_dirs[res_size].values():
+                if isinstance(dir_path, Path):
+                    dir_path.mkdir(parents=True, exist_ok=True)
+            
+            print(f"[{res_name}] Processing {res_name} resolution outputs")
+        else:
+            print(f"[{res_name}] Skipping - {res_name}_newest already has output files")
+
+    print(f"[DEBUG] Output base_dir: {base_dir}")
     print(f"  - newest_pcd: {newest_pcd_dir}")
     print(f"  - newest_depth_maps: {newest_depth_maps_dir}")
     print(f"  - newest_viz_results: {newest_viz_results_dir}")
     print(f"  - newest_colormap: {newest_colormap_dir}")
+    print(f"  - newest_synthetic_depth_maps: {newest_synthetic_depth_maps_dir}")
+    print(f"  - diff_results: {diff_results_dir}")  # [ADD]
+    
+    # Print resized directories info
+    for res_size in resized_resolutions:
+        res_name = f"{res_size[0]}x{res_size[1]}"
+        if process_resized[res_size]:
+            print(f"[DEBUG] {res_name} Output base_dir: {resized_dirs[res_size]['base']}")
 
     if not pcd_input_dir.exists():
         print(f"Error: PCD input directory not found: {pcd_input_dir}")
@@ -824,6 +1251,42 @@ def run_integrated_pipeline(
     for pcd_path in tqdm(pcd_files, desc="Processing PCDs"):
         try:
             print(f"\n[PROCESS] Starting {pcd_path.name}...")
+
+            stem = pcd_path.stem
+            out_pcd_path = newest_pcd_dir / f"{stem}.pcd"
+            merged_depth_path = newest_depth_maps_dir / f"{stem}.png"
+            synth_depth_path = newest_synthetic_depth_maps_dir / f"{stem}.png"
+            viz_path = newest_viz_results_dir / f"{stem}_depth_analysis.png"
+            colormap_path = newest_colormap_dir / f"{stem}_colorized.png"
+            diff_merged_path = diff_results_dir / f"{stem}_merged.png"   # [ADD]
+            diff_synth_path  = diff_results_dir / f"{stem}_synth.png"    # [ADD]
+            diff_orig_path   = diff_results_dir / f"{stem}_orig.png"     # [ADD]
+
+            # [FIX] Check original resolution outputs first
+            # 모든 산출물 (색상 diff 포함) 존재 시 스킵
+            original_outputs_exist = all(p.exists() for p in [
+                out_pcd_path, merged_depth_path, synth_depth_path,
+                viz_path, colormap_path,
+                diff_merged_path, diff_synth_path, diff_orig_path
+            ])
+            
+            # [FIX] Also check resized resolution outputs
+            resized_outputs_exist = True
+            for res_size in resized_resolutions:
+                if process_resized[res_size]:  # Only check resolutions that need processing
+                    res_dirs = resized_dirs[res_size]
+                    resized_outputs_exist = resized_outputs_exist and all(p.exists() for p in [
+                        res_dirs['viz_results'] / f"{stem}_depth_analysis.png",
+                        res_dirs['colormap'] / f"{stem}_colorized.png",
+                        res_dirs['diff_results'] / f"{stem}_merged.png",
+                        res_dirs['diff_results'] / f"{stem}_synth.png",
+                        res_dirs['diff_results'] / f"{stem}_orig.png",
+                    ])
+            
+            # Skip only if both original and resized outputs exist
+            if original_outputs_exist and resized_outputs_exist:
+                print(f"[SKIP] All outputs (incl. color diff) already exist for {stem}.")
+                continue
 
             # Step 1: Generate closest-line (diagnostic) and load original points
             closest_line_points, original_points = find_nearest_road_point_and_generate_synthetic_pcd(
@@ -890,73 +1353,213 @@ def run_integrated_pipeline(
             depth_synth, _ = projector.project_cloud_to_depth_map_with_labels(
                 camera_name, synth_only, lbl_synth, reference_image_size
             )
-
             merged_pts = np.vstack([orig_pts, synth_only])
             merged_labels = np.concatenate([lbl_orig, lbl_synth])
             depth_merge, prov = projector.project_cloud_to_depth_map_with_labels(
                 camera_name, merged_pts, merged_labels, reference_image_size
             )
 
+            # [ADD] Process resized resolutions (640x512, 640x384)
+            for resized_image_size in resized_resolutions:
+                res_name = f"{resized_image_size[0]}x{resized_image_size[1]}"
+                
+                if not process_resized[resized_image_size]:
+                    continue
+                
+                # Generate depth maps for this resolution
+                depth_orig_resized, _ = projector.project_cloud_to_depth_map_with_labels(
+                    camera_name, orig_pts, lbl_orig, resized_image_size
+                )
+                depth_synth_resized, _ = projector.project_cloud_to_depth_map_with_labels(
+                    camera_name, synth_only, lbl_synth, resized_image_size
+                )
+                depth_merge_resized, prov_resized = projector.project_cloud_to_depth_map_with_labels(
+                    camera_name, merged_pts, merged_labels, resized_image_size
+                )
+                
+                # Get directory paths for this resolution
+                dirs = resized_dirs[resized_image_size]
+                
+                # Define output paths
+                resized_out_pcd_path = dirs['pcd'] / f"{stem}.pcd"
+                resized_merged_depth_path = dirs['depth_maps'] / f"{stem}.png"
+                resized_synth_depth_path = dirs['synthetic_depth_maps'] / f"{stem}.png"
+                resized_viz_path = dirs['viz_results'] / f"{stem}_depth_analysis.png"
+                resized_colormap_path = dirs['colormap'] / f"{stem}_colorized.png"
+                resized_diff_merged_path = dirs['diff_results'] / f"{stem}_merged.png"
+                resized_diff_synth_path = dirs['diff_results'] / f"{stem}_synth.png"
+                resized_diff_orig_path = dirs['diff_results'] / f"{stem}_orig.png"
+                
+                # Save resized PCD (same as original resolution)
+                save_synthetic_pcd(points_to_use, resized_out_pcd_path)
+                
+                # Save resized depth maps
+                save_depth_map(resized_merged_depth_path, depth_merge_resized)
+                
+                synth_only_depth_resized = np.zeros_like(depth_merge_resized, dtype=np.float32)
+                synth_only_depth_resized[prov_resized == 1] = depth_merge_resized[prov_resized == 1]
+                save_depth_map(resized_synth_depth_path, synth_only_depth_resized)
+                
+                # [FIX] RGB+Depth 시각화: 저장된 깊이맵 PNG를 직접 읽어서 사용
+                # (PCD 재투영이 아닌 실제 저장된 깊이맵으로 검증)
+                rgb_path = base_dir / "image_a6" / f"{stem}.jpg"
+                if not rgb_path.exists():
+                    rgb_path = base_dir / "image_a6" / f"{stem}.png"
+                
+                # Determine point size based on resolution
+                point_size = 4 if resized_image_size[0] >= 1280 else 2
+                
+                if rgb_path.exists():
+                    # 저장된 깊이맵 PNG를 직접 로드 (uint16 → float32 변환)
+                    # save_depth_map에서 *256으로 저장했으므로 /256으로 복원
+                    depth_uint16 = cv2.imread(str(resized_merged_depth_path), cv2.IMREAD_UNCHANGED)
+                    if depth_uint16 is not None:
+                        depth_map_from_file = depth_uint16.astype(np.float32) / 256.0  # KITTI 포맷: uint16 / 256 → meters
+                    else:
+                        print(f"[WARN] Failed to load saved depth map: {resized_merged_depth_path}")
+                        depth_map_from_file = depth_merge_resized  # Fallback
+                    
+                    rgb_image_original = cv2.imread(str(rgb_path))
+                    rgb_image_resized = cv2.resize(
+                        rgb_image_original, resized_image_size,
+                        interpolation=cv2.INTER_AREA
+                    )
+                    rgb_with_depth = create_rgb_with_depth_scatter(
+                        rgb_image_resized.copy(), depth_map_from_file,
+                        point_size=point_size, max_depth=15.0
+                    )
+                    cv2.imwrite(str(resized_viz_path), rgb_with_depth)
+                    print(f"[SAVE] RGB+Depth visualization ({res_name}) saved: {resized_viz_path.name}")
+                else:
+                    print(f"[SKIP] RGB image not found for {res_name} viz: {rgb_path}")
+                    # RGB 없어도 저장된 깊이맵은 로드해서 colormap 생성
+                    depth_uint16 = cv2.imread(str(resized_merged_depth_path), cv2.IMREAD_UNCHANGED)
+                    if depth_uint16 is not None:
+                        depth_map_from_file = depth_uint16.astype(np.float32) / 256.0
+                    else:
+                        depth_map_from_file = depth_merge_resized
+                
+                # [FIX] Colormap도 저장된 깊이맵 사용
+                create_depth_colormap_image(depth_map_from_file, resized_colormap_path)
+                
+                # Save resized diff colormaps
+                save_diff_depth_colormap(resized_diff_merged_path, depth_merge_resized, 
+                                       point_thickness=diff_point_size, dilation_iterations=diff_point_iterations)
+                save_diff_depth_colormap(resized_diff_synth_path, depth_synth_resized, 
+                                       point_thickness=diff_point_size, dilation_iterations=diff_point_iterations)
+                save_diff_depth_colormap(resized_diff_orig_path, depth_orig_resized, 
+                                       point_thickness=diff_point_size, dilation_iterations=diff_point_iterations)
+                
+                print(f"[{res_name}] Saved all {res_name} outputs for {stem}")
+
             # 영향 픽셀 계산
             changed_mask = (depth_merge > 0) & ((depth_orig == 0) | (np.abs(depth_merge - depth_orig) > 1e-4))
             synth_new_pixels = int(np.sum((depth_orig == 0) & (depth_synth > 0)))
             synth_override_pixels = int(np.sum((depth_orig > 0) & (depth_merge != depth_orig) & (prov == 1)))
             total_valid_merge = int(np.sum(depth_merge > 0))
-
             print(f"[DIFF] new_pixels_from_synth={synth_new_pixels}, overrides={synth_override_pixels}, total_valid={total_valid_merge}")
 
-            # 저장 (간단한 8bit 시각화)
-            debug_dir = newest_depth_maps_dir / "debug_diff"
-            debug_dir.mkdir(exist_ok=True, parents=True)
-            def save_debug(name, dm):
-                dm_u8 = np.clip(dm / (np.percentile(dm[dm>0],95)+1e-6) * 255, 0, 255).astype(np.uint8)
-                cv2.imwrite(str(debug_dir / f"{pcd_path.stem}_{name}.png"), dm_u8)
+            # [REMOVED] debug diff 이미지 저장 블록 제거 (orig_only / synth_only / merged / provenance)
+            # (요청: diff 관련 저장 생략)
 
-            save_debug("orig_only", depth_orig)
-            save_debug("synth_only", depth_synth)
-            save_debug("merged", depth_merge)
+            # [KEEP + MODIFY] synthetic-only depth 저장 (중복 시 스킵)
+            if not synth_depth_path.exists():
+                synth_only_depth_map = np.zeros_like(depth_merge, dtype=np.float32)
+                synth_only_depth_map[prov == 1] = depth_merge[prov == 1]
+                save_depth_map(synth_depth_path, synth_only_depth_map)
+                valid_synth = synth_only_depth_map[synth_only_depth_map > 0]
+                if valid_synth.size > 0:
+                    print(f"[SYNTH_SAVE] {synth_depth_path.name}: pixels={valid_synth.size}, "
+                          f"mean={valid_synth.mean():.3f}m, max={valid_synth.max():.3f}m")
+                else:
+                    print(f"[SYNTH_SAVE] {synth_depth_path.name}: (no synthetic pixels)")
+            else:
+                print(f"[SKIP] Synthetic depth already exists: {synth_depth_path.name}")
 
-            # provenance 컬러: -1=white, 0=blue,1=red
-            prov_vis = np.full((*prov.shape,3), 255, np.uint8)
-            prov_vis[prov==0] = (255,0,0)   # BGR: original=Blue channel? (파랑)
-            prov_vis[prov==1] = (0,0,255)   # synthetic=Red
-            cv2.imwrite(str(debug_dir / f"{pcd_path.stem}_provenance.png"), prov_vis)
+            # merged depth 저장 (중복 시 스킵)
+            if not merged_depth_path.exists():
+                save_depth_map(merged_depth_path, depth_merge)
+            else:
+                print(f"[SKIP] Merged depth already exists: {merged_depth_path.name}")
 
-            # 기존 save_depth_map 대체
-            depth_map_path = newest_depth_maps_dir / f"{pcd_path.stem}.png"
-            save_depth_map(depth_map_path, depth_merge)
+            # PCD 저장 (중복 시 스킵)
+            if not out_pcd_path.exists():
+                save_synthetic_pcd(points_to_use, out_pcd_path)
+                print(f"[SAVE] Output PCD saved: {out_pcd_path}")
+            else:
+                print(f"[SKIP] PCD already exists: {out_pcd_path.name}")
 
-            # Step 2: Save output PCD
-            newest_pcd_path = newest_pcd_dir / f"{pcd_path.stem}.pcd"
-            save_synthetic_pcd(points_to_use, newest_pcd_path)
-            print(f"[SAVE] Output PCD saved: {newest_pcd_path}")
+            # [FIX] RGB+Depth 시각화: 저장된 깊이맵 PNG를 직접 사용
+            viz_path = newest_viz_results_dir / f"{stem}_depth_analysis.png"
+            if not viz_path.exists():
+                # 저장된 깊이맵 로드
+                depth_uint16 = cv2.imread(str(merged_depth_path), cv2.IMREAD_UNCHANGED)
+                if depth_uint16 is not None:
+                    depth_map = depth_uint16.astype(np.float32) / 256.0  # KITTI 포맷: uint16 / 256 → meters
+                else:
+                    print(f"[ERROR] Failed to load depth map: {merged_depth_path}")
+                    failed_count += 1
+                    continue
+                
+                # RGB+Depth 시각화
+                rgb_path = base_dir / "image_a6" / f"{stem}.jpg"
+                if not rgb_path.exists():
+                    rgb_path = base_dir / "image_a6" / f"{stem}.png"
+                
+                if rgb_path.exists():
+                    rgb_image = cv2.imread(str(rgb_path))
+                    rgb_with_depth = create_rgb_with_depth_scatter(
+                        rgb_image.copy(), depth_map, 
+                        point_size=4, max_depth=15.0
+                    )
+                    cv2.imwrite(str(viz_path), rgb_with_depth)
+                    print(f"[SAVE] RGB+Depth visualization saved: {viz_path.name}")
+                else:
+                    print(f"[SKIP] RGB image not found for viz: {rgb_path}")
+            else:
+                print(f"[SKIP] Viz already exists: {viz_path.name}")
 
-            # Step 3: Generate depth map using merged/synthetic points
-            depth_map = projector.project_cloud_to_depth_map(
-                camera_name, points_to_use, reference_image_size
-            )
+            colormap_path = newest_colormap_dir / f"{stem}_colorized.png"
+            if not colormap_path.exists():
+                # Colormap도 저장된 깊이맵 사용
+                depth_uint16 = cv2.imread(str(merged_depth_path), cv2.IMREAD_UNCHANGED)
+                if depth_uint16 is not None:
+                    depth_map = depth_uint16.astype(np.float32) / 256.0
+                    create_depth_colormap_image(depth_map, colormap_path)
+                else:
+                    print(f"[WARN] Failed to load depth map for colormap: {merged_depth_path}")
+            else:
+                print(f"[SKIP] Colormap already exists: {colormap_path.name}")
 
-            if depth_map is None:
-                print(f"[ERROR] Failed to generate depth map for {pcd_path.name}")
-                failed_count += 1
-                continue
+            # diff 결과 저장 (이제 컬러만)  [MODIFIED]
+            if not diff_merged_path.exists():
+                save_diff_depth_colormap(diff_merged_path, depth_merge, point_thickness=diff_point_size, dilation_iterations=diff_point_iterations)
+                print(f"[DIFF_COLOR] merged -> {diff_merged_path.name}")
+            else:
+                print(f"[SKIP] Diff merged exists: {diff_merged_path.name}")
 
-            # Step 4: Save outputs
-            viz_path = newest_viz_results_dir / f"{pcd_path.stem}_depth_analysis.png"
-            create_depth_visualization(depth_map, viz_path, f"C-Circles Depth Map - {pcd_path.stem}")
+            if not diff_synth_path.exists():
+                save_diff_depth_colormap(diff_synth_path, depth_synth, point_thickness=diff_point_size, dilation_iterations=diff_point_iterations)
+                print(f"[DIFF_COLOR] synth-only -> {diff_synth_path.name}")
+            else:
+                print(f"[SKIP] Diff synth exists: {diff_synth_path.name}")
 
-            colormap_path = newest_colormap_dir / f"{pcd_path.stem}_colorized.png"
-            create_depth_colormap_image(depth_map, colormap_path)
+            if not diff_orig_path.exists():
+                save_diff_depth_colormap(diff_orig_path, depth_orig, point_thickness=diff_point_size, dilation_iterations=diff_point_iterations)
+                print(f"[DIFF_COLOR] orig-only -> {diff_orig_path.name}")
+            else:
+                print(f"[SKIP] Diff orig exists: {diff_orig_path.name}")
 
             processed_count += 1
             print(f"[SUCCESS] Completed {pcd_path.name}")
-
         except Exception as e:
-            print(f"[ERROR] Processing {pcd_path.name}: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[ERROR] Processing {pcd_path.name}: {e}", flush=True)
+            try:
+                import traceback
+                traceback.print_exc(file=sys.stderr)
+            except:
+                pass  # Silently ignore traceback errors
             failed_count += 1
-
     print(f"\n=== Pipeline Complete ===")
     print(f"Successfully processed: {processed_count} files")
     print(f"Failed: {failed_count} files")
@@ -965,53 +1568,22 @@ def run_integrated_pipeline(
     print(f"  - Raw depth maps (16bit): {newest_depth_maps_dir}")
     print(f"  - Analysis plots: {newest_viz_results_dir}")
     print(f"  - Colorized images: {newest_colormap_dir}")
-
-def test_single_file(pcd_file_path: str, num_divisions: int = 20, points_per_circle: int = 200, exclude_outermost: bool = True) -> None:
-    """단일 파일 테스트용 함수"""
-    pcd_path = Path(pcd_file_path)
-    if not pcd_path.exists():
-        print(f"Error: File not found: {pcd_path}")
-        return
+    print(f"  - Diff (merged/synth/orig): {diff_results_dir}")  # [ADD]
     
-    # [FIX] synced_data 디렉토리를 직접 parent_folder로 사용
-    # 예상 구조: ncdb-cls-sample/synced_data/pcd/xxxx.pcd
-    pcd_parent = pcd_path.parent  # pcd 폴더
-    synced_data_dir = pcd_parent.parent  # synced_data 폴더
-    
-    # 임시 테스트 디렉토리를 synced_data 아래에 생성
-    test_dir = synced_data_dir / "test_single_file"
-    temp_pcd_dir = test_dir / "pcd"
-    temp_pcd_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Copy file to temporary structure
-    import shutil
-    temp_pcd_path = temp_pcd_dir / pcd_path.name
-    if not temp_pcd_path.exists():
-        shutil.copy2(pcd_path, temp_pcd_path)
-    
-    print(f"=== Testing single file: {pcd_path.name} ===")
-    print(f"Temporary test directory: {test_dir}")
-    print(f"[DEBUG] test_single_file received parameters:")
-    print(f"  - num_divisions: {num_divisions}")
-    print(f"  - points_per_circle: {points_per_circle}")
-    print(f"  - exclude_outermost: {exclude_outermost}")
-    
-    # [FIX] synced_data를 parent_folder로 전달하여 바로 그 아래에 폴더 생성
-    run_integrated_pipeline(
-        parent_folder=synced_data_dir,  # synced_data 레벨에서 실행
-        num_radius_divisions=num_divisions,
-        points_per_circle=points_per_circle,
-        exclude_outermost_circle=exclude_outermost
-    )
-    
-    print(f"\n=== Test Complete ===")
-    print(f"Results are in:")
-    print(f"  - {synced_data_dir / 'newest_pcd'}")
-    print(f"  - {synced_data_dir / 'newest_depth_maps'}")  
-    print(f"  - {synced_data_dir / 'newest_viz_results'}")
-    print(f"  - {synced_data_dir / 'newest_colormap'}")
+    # [ADD] Print resized resolutions summary
+    for res_size in resized_resolutions:
+        res_name = f"{res_size[0]}x{res_size[1]}"
+        if process_resized[res_size]:
+            print(f"[{res_name}] All {res_name} outputs saved to: {resized_dirs[res_size]['base']}")
 
 def main():
+    # [FIX] Force UTF-8 output encoding to prevent cp949 errors on Windows
+    import sys
+    if sys.stdout.encoding != 'utf-8':
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    if sys.stderr.encoding != 'utf-8':
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    
     parser = argparse.ArgumentParser(description="Integrated PCD to Depth Map Pipeline")
     parser.add_argument("--parent_folder", type=str, required=True,
                         help="Parent folder containing 'pcd' directory")
@@ -1041,6 +1613,10 @@ def main():
                         help="(compat) Exclude outermost circle (unused)")
     parser.add_argument("--include_outermost", action="store_true",
                         help="(compat) Include all circles (unused)")
+    parser.add_argument("--diff_point_size", type=int, default=3,
+                        help="Point (dilation) size for diff colormap (default: 7, was 5)")
+    parser.add_argument("--diff_point_iterations", type=int, default=1,
+                        help="Number of dilation iterations (repeat expansion) for diff points (default: 1)")
     
     args = parser.parse_args()
 
@@ -1051,12 +1627,7 @@ def main():
         exclude_outermost_circle = args.exclude_outermost
 
     if args.test_file:
-        test_single_file(
-            pcd_file_path=args.test_file,
-            num_divisions=args.num_divisions, 
-            points_per_circle=args.points_per_circle, 
-            exclude_outermost=exclude_outermost_circle
-        )
+        pass  # 단일 파일 테스트 모드 (필요시 구현)
     else:
         parent_folder = Path(args.parent_folder)
         if not parent_folder.exists():
@@ -1075,10 +1646,10 @@ def main():
             num_radius_divisions=args.num_divisions,   # compat
             points_per_circle=args.points_per_circle,   # compat
             keep_original_points=not args.synthetic_only,  # compat
-            exclude_outermost_circle=exclude_outermost_circle  # compat
+            exclude_outermost_circle=exclude_outermost_circle,  # compat
+            diff_point_size=args.diff_point_size,
+            diff_point_iterations=args.diff_point_iterations
         )
 
 if __name__ == "__main__":
     main()
-
-# integrated_pcd_depth_pipeline.py
