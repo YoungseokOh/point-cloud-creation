@@ -1134,13 +1134,28 @@ def run_integrated_pipeline(
     keep_original_points: bool = True,
     exclude_outermost_circle: bool = True,
     diff_point_size: int = 5,
-    diff_point_iterations: int = 1
+    diff_point_iterations: int = 1,
+    target_resolution: Optional[str] = None,
+    dry_run: bool = False
 ) -> None:
-    print(f"=== Integrated PCD-to-Depth Pipeline (Closest-Line Mode) ===")
+    print(f"=== Integrated PCD-to-Depth Pipeline v2 (Closest-Line Mode) ===")
+    print(f"[COORD] v2 coordinate system (X < 0 = forward, ncdb-cls)")
     print(f"Parent folder: {parent_folder}")
     print(f"Closest-line parameters:")
     print(f"  - Ground Z range: [{ground_z_min:.3f}, {ground_z_max:.3f}]")
     print(f"  - XY distance range: [{min_xy_distance:.3f}, {xy_radius_threshold:.3f}]")
+    print(f"  - BLUE_DEPTH_Z: {BLUE_DEPTH_Z}")
+
+    # Parse target_resolution
+    skip_original_resolution = False
+    if target_resolution:
+        try:
+            target_w, target_h = map(int, target_resolution.split('x'))
+            skip_original_resolution = True
+            print(f"[INFO] Target resolution: {target_resolution} only (skipping original resolution)")
+        except:
+            print(f"[WARN] Invalid target_resolution '{target_resolution}', processing all resolutions")
+            target_resolution = None
 
     # Resolve input (pcd) directory and output base directory robustly
     if (parent_folder / "pcd").is_dir():
@@ -1167,18 +1182,37 @@ def run_integrated_pipeline(
     newest_viz_results_dir = base_dir / "newest_viz_results"
     newest_colormap_dir = base_dir / "newest_colormap"
     newest_synthetic_depth_maps_dir = base_dir / "newest_synthetic_depth_maps"  # synthetic 전용
+    newest_original_depth_maps_dir = base_dir / "newest_original_depth_maps"  # original LiDAR only
+    newest_original_colormap_dir = base_dir / "newest_original_colormap"  # original LiDAR colormap
     diff_results_dir = base_dir / "diff_results"  # [ADD]
 
-    newest_pcd_dir.mkdir(parents=True, exist_ok=True)
-    newest_depth_maps_dir.mkdir(parents=True, exist_ok=True)
-    newest_viz_results_dir.mkdir(parents=True, exist_ok=True)
-    newest_colormap_dir.mkdir(parents=True, exist_ok=True)
-    newest_synthetic_depth_maps_dir.mkdir(parents=True, exist_ok=True)
-    diff_results_dir.mkdir(parents=True, exist_ok=True)  # [ADD]
+    # [FIX] 원본 해상도 처리 여부에 따라 디렉토리 생성
+    if not skip_original_resolution:
+        newest_pcd_dir.mkdir(parents=True, exist_ok=True)
+        newest_depth_maps_dir.mkdir(parents=True, exist_ok=True)
+        newest_viz_results_dir.mkdir(parents=True, exist_ok=True)
+        newest_colormap_dir.mkdir(parents=True, exist_ok=True)
+        newest_synthetic_depth_maps_dir.mkdir(parents=True, exist_ok=True)
+        newest_original_depth_maps_dir.mkdir(parents=True, exist_ok=True)
+        newest_original_colormap_dir.mkdir(parents=True, exist_ok=True)
+        diff_results_dir.mkdir(parents=True, exist_ok=True)
 
     # [ADD] Resized output directories (640x512 and 640x384)
     # Define resized resolutions as a list of tuples (width, height)
     resized_resolutions = [(640, 512), (640, 384)]
+    
+    # [FIX] target_resolution이 지정되면 해당 해상도만 처리
+    if target_resolution:
+        try:
+            target_w, target_h = map(int, target_resolution.split('x'))
+            target_res = (target_w, target_h)
+            if target_res in resized_resolutions:
+                resized_resolutions = [target_res]  # 해당 해상도만 처리
+                print(f"[INFO] Only processing {target_resolution} resolution")
+            else:
+                print(f"[WARN] Target resolution {target_resolution} not in supported list, processing all")
+        except:
+            pass
     
     # Initialize dictionaries to store directory paths for each resolution
     resized_dirs = {}  # {(w, h): {pcd_dir, depth_maps_dir, ...}}
@@ -1197,6 +1231,8 @@ def run_integrated_pipeline(
             'viz_results': resized_base_dir / "newest_viz_results",
             'colormap': resized_base_dir / "newest_colormap",
             'synthetic_depth_maps': resized_base_dir / "newest_synthetic_depth_maps",
+            'original_depth_maps': resized_base_dir / "newest_original_depth_maps",
+            'original_colormap': resized_base_dir / "newest_original_colormap",
             'diff_results': resized_base_dir / "diff_results",
         }
         
@@ -1244,6 +1280,16 @@ def run_integrated_pipeline(
         return
 
     print(f"Processing {len(pcd_files)} PCD files...")
+
+    # Dry run mode
+    if dry_run:
+        print("\n=== DRY RUN MODE ===")
+        print(f"Would process {len(pcd_files)} PCD files")
+        print(f"First 5 files: {[f.name for f in pcd_files[:5]]}")
+        if len(pcd_files) > 5:
+            print(f"Last 5 files: {[f.name for f in pcd_files[-5:]]}")
+        print("Exiting without processing (dry-run mode)")
+        return
 
     processed_count = 0
     failed_count = 0
@@ -1442,6 +1488,12 @@ def run_integrated_pipeline(
                 # [FIX] Colormap도 저장된 깊이맵 사용
                 create_depth_colormap_image(depth_map_from_file, resized_colormap_path)
                 
+                # [ADD] Original depth maps 저장 (synthetic 없이 원본 LiDAR만)
+                resized_orig_depth_path = dirs['original_depth_maps'] / f"{stem}.png"
+                resized_orig_colormap_path = dirs['original_colormap'] / f"{stem}_colorized.png"
+                save_depth_map(resized_orig_depth_path, depth_orig_resized)
+                create_depth_colormap_image(depth_orig_resized, resized_orig_colormap_path)
+                
                 # Save resized diff colormaps
                 save_diff_depth_colormap(resized_diff_merged_path, depth_merge_resized, 
                                        point_thickness=diff_point_size, dilation_iterations=diff_point_iterations)
@@ -1451,6 +1503,12 @@ def run_integrated_pipeline(
                                        point_thickness=diff_point_size, dilation_iterations=diff_point_iterations)
                 
                 print(f"[{res_name}] Saved all {res_name} outputs for {stem}")
+
+            # [FIX] 원본 해상도 처리 스킵
+            if skip_original_resolution:
+                processed_count += 1
+                print(f"[SKIP] Original resolution outputs (--resolution specified)")
+                continue
 
             # 영향 픽셀 계산
             changed_mask = (depth_merge > 0) & ((depth_orig == 0) | (np.abs(depth_merge - depth_orig) > 1e-4))
@@ -1550,6 +1608,20 @@ def run_integrated_pipeline(
             else:
                 print(f"[SKIP] Diff orig exists: {diff_orig_path.name}")
 
+            # [ADD] Original depth maps 저장 (synthetic 없이 원본 LiDAR만)
+            orig_depth_path = newest_original_depth_maps_dir / f"{stem}.png"
+            orig_colormap_path = newest_original_colormap_dir / f"{stem}_colorized.png"
+            if not orig_depth_path.exists():
+                save_depth_map(orig_depth_path, depth_orig)
+                print(f"[SAVE] Original depth map: {orig_depth_path.name}")
+            else:
+                print(f"[SKIP] Original depth already exists: {orig_depth_path.name}")
+            if not orig_colormap_path.exists():
+                create_depth_colormap_image(depth_orig, orig_colormap_path)
+                print(f"[SAVE] Original colormap: {orig_colormap_path.name}")
+            else:
+                print(f"[SKIP] Original colormap already exists: {orig_colormap_path.name}")
+
             processed_count += 1
             print(f"[SUCCESS] Completed {pcd_path.name}")
         except Exception as e:
@@ -1564,11 +1636,14 @@ def run_integrated_pipeline(
     print(f"Successfully processed: {processed_count} files")
     print(f"Failed: {failed_count} files")
     print(f"Output directories:")
-    print(f"  - Closest-line PCDs: {newest_pcd_dir}")
-    print(f"  - Raw depth maps (16bit): {newest_depth_maps_dir}")
-    print(f"  - Analysis plots: {newest_viz_results_dir}")
-    print(f"  - Colorized images: {newest_colormap_dir}")
-    print(f"  - Diff (merged/synth/orig): {diff_results_dir}")  # [ADD]
+    if not skip_original_resolution:
+        print(f"  - Closest-line PCDs: {newest_pcd_dir}")
+        print(f"  - Raw depth maps (16bit): {newest_depth_maps_dir}")
+        print(f"  - Original depth maps (16bit): {newest_original_depth_maps_dir}")
+        print(f"  - Analysis plots: {newest_viz_results_dir}")
+        print(f"  - Colorized images: {newest_colormap_dir}")
+        print(f"  - Original colormaps: {newest_original_colormap_dir}")
+        print(f"  - Diff (merged/synth/orig): {diff_results_dir}")
     
     # [ADD] Print resized resolutions summary
     for res_size in resized_resolutions:
@@ -1617,6 +1692,10 @@ def main():
                         help="Point (dilation) size for diff colormap (default: 7, was 5)")
     parser.add_argument("--diff_point_iterations", type=int, default=1,
                         help="Number of dilation iterations (repeat expansion) for diff points (default: 1)")
+    parser.add_argument("--resolution", type=str, default=None,
+                        help="Target resolution only (e.g., '640x384', '640x512'). If not specified, all resolutions are processed.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Dry run mode - show what would be processed without actually processing")
     
     args = parser.parse_args()
 
@@ -1648,7 +1727,9 @@ def main():
             keep_original_points=not args.synthetic_only,  # compat
             exclude_outermost_circle=exclude_outermost_circle,  # compat
             diff_point_size=args.diff_point_size,
-            diff_point_iterations=args.diff_point_iterations
+            diff_point_iterations=args.diff_point_iterations,
+            target_resolution=args.resolution,
+            dry_run=getattr(args, 'dry_run', False)
         )
 
 if __name__ == "__main__":

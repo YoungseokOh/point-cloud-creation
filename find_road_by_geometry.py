@@ -30,11 +30,11 @@ distance_line_geometry = None
 # NEW: vertical purple z-line at black line end
 vertical_purple_line_geometry = None
 
-# NEW: fixed blue depth line and marker at (0,0,-0.771)
+# NEW: fixed blue depth line and marker at (0,0,-0.749149)
 blue_depth_line_geometry = None
 blue_marker_geometry = None
 last_blue_marker_pos = None
-BLUE_DEPTH_Z = -0.771
+BLUE_DEPTH_Z = -0.749149  # [FIX] 새로운 좌표계 v3의 Z translation 값과 일치
 
 # NEW: g yellow vertical segment (0,0,BLUE_DEPTH_Z) -> (0,0,z_purple)
 yellow_g_line_geometry = None
@@ -54,7 +54,7 @@ DRAW_ANGLE_ARCS = False
 c_circles_geometry = None
 # Previous method circles (ground plane) for comparison
 c_circles_prev_geometry = None
-NUM_C_RADII = 25            # 더 촘촘하게 링 생성
+NUM_C_RADII = 20            # 더 촘촘하게 링 생성
 CIRCLE_SEGS = 128
 SKIP_FAR_COUNT = 1         # 먼쪽(보라색점 방향)에서 N개 링 제거, 가까운 쪽은 살림
 RING_RADIUS_SCALE = 0.15
@@ -63,7 +63,7 @@ RING_RADIUS_MAX = 0.50
 NEAR_BIAS = 1.2
 MIN_FIRST_RADIUS = 0.01
 # NEW: radii distribution along c
-RADIUS_DISTRIBUTION = "cosine"  # 'uniform' | 'near' | 'cosine' (cosine: 양 끝이 더 촘촘)
+RADIUS_DISTRIBUTION = "uniform"  # 'uniform' | 'near' | 'cosine' (cosine: 양 끝이 더 촘촘)
 # NEW: options
 DRAW_PREV_CIRCLES = False   # 빨간색 방식은 비교를 위해 기본 끔(요청: 주석처리 대체)
 c_circles_pcd_geometry = None  # 원 포인트들을 모아 PCD로 표시
@@ -80,7 +80,7 @@ def find_closest_line_by_euclidean_distance(
     ground_z_max=0.5,   # Z-filter: Maximum height to be considered ground
     min_xy_distance_from_origin=0.0, # New: Minimum horizontal distance from origin
     xy_radius_threshold=np.inf, # New: Maximum horizontal distance from origin
-    exclude_positive_x=True, # New: Exclude points with positive X-coordinates
+    exclude_negative_x=True, # [v3 좌표계] X > 0 = 전방, X < 0 = 후방 제외
     angular_resolution=1.0, # Degrees per bin for finding closest points
     y_zero_band=0.01  # NEW: highlight |y| <= band in purple
 ):
@@ -147,12 +147,12 @@ def find_closest_line_by_euclidean_distance(
         ground_points = ground_points[xy_radius_filtered_indices]
         ground_indices = ground_indices[xy_radius_filtered_indices] # Update original indices as well
 
-    # Apply X-axis positive exclusion filter
-    if exclude_positive_x:
-        x_filtered_indices = np.where(ground_points[:, 0] <= 0)[0]
+    # [v3 좌표계] X > 0 = 전방, X <= 0 = 후방 제외
+    if exclude_negative_x:
+        x_filtered_indices = np.where(ground_points[:, 0] > 0)[0]  # [v3] X > 0 = 전방
 
         if len(x_filtered_indices) == 0:
-            print("Error: No ground candidate points found after excluding positive X-coordinates.")
+            print("Error: No ground candidate points found after excluding negative X-coordinates.")
             pcd_display = o3d.geometry.PointCloud()
             pcd_display.points = pcd_original.points
             pcd_display.paint_uniform_color([0.5, 0.5, 0.5]) # Gray
@@ -217,13 +217,13 @@ def find_closest_line_by_euclidean_distance(
     # Color the closest line points cyan within the display point cloud
     colors[original_indices_of_closest_line] = [0, 1, 1] # Cyan
 
-    # Select a single purple point near y==0 (exclude x>0), and print its info
+    # Select a single purple point near y==0 (X > 0 = forward for v3), and print its info
     all_points = np.asarray(pcd_display.points)
     x_vals = all_points[:, 0]
     y_vals = all_points[:, 1]
 
-    # Candidates: |y| <= band and x <= 0
-    y_zero_mask = (np.abs(y_vals) <= y_zero_band) & (x_vals <= 0.0)
+    # [v3 좌표계] |y| <= band and x > 0 (전방)
+    y_zero_mask = (np.abs(y_vals) <= y_zero_band) & (x_vals > 0.0)
     y_zero_indices = np.where(y_zero_mask)[0]
 
     # NEW: expose selected marker position via module-global
@@ -265,7 +265,7 @@ def find_closest_line_by_euclidean_distance(
             print("[y≈0 one-point] no candidate with positive distance")
             selected_marker_pos = None
     else:
-        print("[y≈0 one-point] no candidates within |y| band and x<=0")
+        print("[y≈0 one-point] no candidates within |y| band and x>0")  # [v3 좌표계]
         selected_marker_pos = None
 
     pcd_display.colors = o3d.utility.Vector3dVector(colors)
@@ -303,14 +303,15 @@ def update_visualization(vis_instance):
             return
 
         # Call the analysis function
+        # [v3 좌표계] X > 0 = 전방
         display_pcd, origin_sphere, closest_line_points = find_closest_line_by_euclidean_distance(
             pcd_original,
             ground_z_min=-10.0,
             ground_z_max=-0.65,
             min_xy_distance_from_origin=1.0,
-            xy_radius_threshold=2.85,
-            exclude_positive_x=True,
-            angular_resolution=0.85
+            xy_radius_threshold=10.0,
+            exclude_negative_x=True,   # [v3 좌표계]
+            angular_resolution=1.0
         )
 
         if display_pcd is None: # Error occurred in analysis
@@ -574,6 +575,20 @@ def update_visualization(vis_instance):
                 cos_t = np.cos(ts)[:, None]
                 sin_t = np.sin(ts)[:, None]
 
+                # NEW: closest_line_points의 azimuth별 거리 맵 구축 (시안색 라인 넘어가는 점 필터링용)
+                cyan_azimuth_dist = {}  # azimuth_bin -> distance from blue point
+                if closest_line_points is not None and len(closest_line_points) > 0:
+                    for cp in closest_line_points:
+                        # 시안색 포인트에서 blue point까지의 거리 계산
+                        cp_from_blue = cp - center
+                        cp_dist = float(np.linalg.norm(cp_from_blue))
+                        # azimuth 계산 (XY 평면 기준)
+                        azimuth = np.arctan2(cp[1], cp[0])
+                        azimuth_deg = int(np.degrees(azimuth))  # 정수 bin
+                        # 같은 bin에 여러 점이 있으면 가장 가까운 거리 사용
+                        if azimuth_deg not in cyan_azimuth_dist or cp_dist < cyan_azimuth_dist[azimuth_deg]:
+                            cyan_azimuth_dist[azimuth_deg] = cp_dist
+
                 for r in radii_along_c:
                     # 1) 보라색점을 지나는 원(r == c_len)은 그리지 않음
                     if abs(r - c_len) <= max(1e-9, 1e-6 * c_len):
@@ -582,11 +597,11 @@ def update_visualization(vis_instance):
                     # Circle in tilted plane spanned by (u_elev, u_tan) -> BLACK (current method)
                     ring = center + r * (cos_t * u_elev + sin_t * u_tan)
 
-                    # 2) X>0 제거: X<=0인 점만 허용 (라인)
+                    # [v3 좌표계] X > 0 = 전방, X > 0인 점만 허용
                     all_pts.append(ring)
                     idxs = np.arange(CIRCLE_SEGS, dtype=np.int32)
                     nxts = (idxs + 1) % CIRCLE_SEGS
-                    valid = (ring[:, 0] <= 0.0)
+                    valid = (ring[:, 0] > 0.0)  # [v3] X > 0 = 전방
                     edge_mask = valid[idxs] & valid[nxts]
                     if np.any(edge_mask):
                         lines = np.column_stack(
@@ -594,12 +609,24 @@ def update_visualization(vis_instance):
                         ).astype(np.int32)
                         all_lines.append(lines)
                         all_colors.append(np.tile([0.0, 0.0, 0.0], (lines.shape[0], 1)))  # black
-                    # 3) PCD용 포인트: X<=0 AND 기존 PCD와 XY거리 >= XY_MIN_SEPARATION
+                    # [v3] PCD용 포인트: X > 0 AND 기존 PCD와 XY거리 >= XY_MIN_SEPARATION
+                    #      + NEW: 시안색 closest line보다 가까운 점만 저장
                     ring_valid_pts = ring[valid]
                     if ring_valid_pts.size > 0:
                         if orig_xy_kdtree is not None:
                             kept = []
                             for p in ring_valid_pts:
+                                # NEW: 시안색 라인 거리 체크 - 해당 방향의 시안색보다 멀면 스킵
+                                p_azimuth = np.arctan2(p[1], p[0])
+                                p_azimuth_deg = int(np.degrees(p_azimuth))
+                                p_from_blue = p - center
+                                p_dist = float(np.linalg.norm(p_from_blue))
+                                
+                                # 해당 azimuth에 시안색 포인트가 있고, synthetic 포인트가 더 멀면 스킵
+                                if p_azimuth_deg in cyan_azimuth_dist:
+                                    if p_dist >= cyan_azimuth_dist[p_azimuth_deg]:
+                                        continue  # 시안색 라인을 넘어감 -> 저장 안함
+                                
                                 q = np.array([p[0], p[1], 0.0], dtype=np.float64)
                                 try:
                                     k, _idx, _d2 = orig_xy_kdtree.search_radius_vector_3d(q, float(XY_MIN_SEPARATION))
@@ -610,7 +637,20 @@ def update_visualization(vis_instance):
                             if kept:
                                 pcd_pts_list.append(np.asarray(kept, dtype=np.float64))
                         else:
-                            pcd_pts_list.append(ring_valid_pts)
+                            # KDTree 없을 때도 시안색 라인 체크 적용
+                            kept_no_kd = []
+                            for p in ring_valid_pts:
+                                p_azimuth = np.arctan2(p[1], p[0])
+                                p_azimuth_deg = int(np.degrees(p_azimuth))
+                                p_from_blue = p - center
+                                p_dist = float(np.linalg.norm(p_from_blue))
+                                
+                                if p_azimuth_deg in cyan_azimuth_dist:
+                                    if p_dist >= cyan_azimuth_dist[p_azimuth_deg]:
+                                        continue
+                                kept_no_kd.append(p)
+                            if kept_no_kd:
+                                pcd_pts_list.append(np.asarray(kept_no_kd, dtype=np.float64))
                     base_idx += CIRCLE_SEGS
 
                 all_pts_np = np.vstack(all_pts) if all_pts else np.zeros((0, 3), dtype=np.float64)
@@ -856,15 +896,15 @@ def run_batch_processing(input_path, output_base_path):
                 print(f"Skipping empty PCD: {filename}")
                 continue
 
-            # 분석 함수 호출
+            # [v3 좌표계] 분석 함수 호출
             _, _, closest_line_points = find_closest_line_by_euclidean_distance(
                 pcd_original,
                 ground_z_min=-10.0,
                 ground_z_max=-0.85,
                 min_xy_distance_from_origin=1.0,
-                xy_radius_threshold=3.0,
-                exclude_positive_x=True,
-                angular_resolution=0.1
+                xy_radius_threshold=10.0,
+                exclude_negative_x=True,   # [v3 좌표계]
+                angular_resolution=1.0
             )
 
             if closest_line_points is not None and len(closest_line_points) > 0:
